@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Professional Calendar</title>
+    <meta name="description" content="An executive-grade calendar featuring Year, Month, Week, and Sunday views, public code-based calendar sharing, an intelligent Gemini AI scheduling assistant, vibrant event categories, and customizable settings." />
+    <meta property="og:title" content="Professional Calendar" />
+    <meta property="og:description" content="An executive-grade calendar featuring Year, Month, Week, and Sunday views, public code-based calendar sharing, an intelligent Gemini AI scheduling assistant, vibrant event categories, and customizable settings." />
+    <script>
+      (function() {
+        try {
+          var raw = localStorage.getItem('pro_calendar_settings_v7') || localStorage.getItem('pro_calendar_permanent_settings_vault_v7');
+          if (raw) {
+            var parsed = JSON.parse(raw);
+            if (parsed.theme === 'dark') {
+              document.documentElement.classList.add('dark');
+            } else if (parsed.theme === 'light') {
+              document.documentElement.classList.remove('dark');
+            }
+          }
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
