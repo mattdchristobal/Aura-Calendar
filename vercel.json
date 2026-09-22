@@ -1,0 +1,24 @@
+{
+  "rewrites": [
+    {
+      "source": "/pdf/(.*)",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/anuncio/(.*)",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/announcement/(.*)",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/flyer/(.*)",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}

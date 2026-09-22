@@ -121,6 +121,16 @@ export interface CalendarEvent {
 
 export type ViewType = 'year' | 'month' | 'week' | 'sunday' | 'day' | 'anuncios';
 
+export interface AnuncioPdfFile {
+  id?: string;
+  filename: string;
+  fileSize: number;
+  mimeType: string;
+  dataUrl?: string;
+  url: string;
+  uploadedAt: string;
+}
+
 export interface AnnouncementFlyer {
   id: string;
   title: string;

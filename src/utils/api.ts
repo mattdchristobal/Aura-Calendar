@@ -13,10 +13,20 @@ export interface SyncData {
 
 export async function fetchSyncData(): Promise<SyncData | null> {
   try {
-    const res = await fetch('/api/sync', {
-      headers: { 'Accept': 'application/json' }
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    let res: Response | null = null;
+    try {
+      res = await fetch('/api/sync', {
+        headers: { 'Accept': 'application/json' }
+      });
+    } catch (e) {
+      res = null;
+    }
+
+    const contentType = res?.headers.get('content-type') || '';
+    if (!res || !res.ok || !contentType.includes('application/json')) {
+      return null;
+    }
+
     return await res.json();
   } catch (err) {
     console.warn('Could not sync with backend server:', err);

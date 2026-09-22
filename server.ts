@@ -8,6 +8,9 @@ import QRCode from "qrcode";
 import { parseIcsContent, normalizeIcsUrl } from "./src/utils/icsParser";
 import defaultOutlookConfig from "./src/data/outlook-config.json";
 import { SEED_EVENTS } from "./src/data/seedEvents";
+import { initializeApp as initFirebaseApp, getApps as getFirebaseApps, getApp as getFirebaseApp } from "firebase/app";
+import { getFirestore as initFirestoreDb, collection as firestoreCol, doc as firestoreDoc, getDocs as firestoreGetDocs, getDoc as firestoreGetDoc, setDoc as firestoreSetDoc, deleteDoc as firestoreDeleteDoc } from "firebase/firestore";
+import firebaseAppConfig from "./firebase-applet-config.json";
 
 interface User {
   id: string;
@@ -212,6 +215,15 @@ interface DatabaseSchema {
   shares?: SharedCalendar[];
   zapier?: ZapierConfig;
   announcements?: AnnouncementFlyer[];
+  anuncioPdf?: {
+    id: string;
+    filename: string;
+    fileSize: number;
+    mimeType: string;
+    dataUrl?: string;
+    uploadedAt: string;
+    updatedAt?: string;
+  };
   deletedEventIds?: string[];
   deletedCategoryIds?: string[];
   deletedUserIds?: string[];
@@ -451,7 +463,7 @@ function deduplicateServerEvents(eventsList: CalendarEvent[], deletedSet?: Set<s
       const existing = resultMap.get(targetKey)!;
       const rawTime = rawEvt.updatedAt ? new Date(rawEvt.updatedAt).getTime() : 0;
       const existTime = existing.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
-      const isRawNewer = rawTime >= existTime;
+      const isRawNewer = rawTime > existTime;
 
       let merged: CalendarEvent;
       if (rawEvt.customizedByAdmin && !existing.customizedByAdmin) {
@@ -474,19 +486,21 @@ function deduplicateServerEvents(eventsList: CalendarEvent[], deletedSet?: Set<s
           adminEditedBy: existing.adminEditedBy
         };
       } else if (isRawNewer) {
-        // Raw incoming event is newer: its fields take precedence
+        // Raw incoming event is strictly newer: its fields take precedence
         merged = {
           ...existing,
           ...rawEvt,
           id: existing.id,
+          categoryId: rawEvt.categoryId || existing.categoryId,
           updatedAt: rawEvt.updatedAt || existing.updatedAt || new Date().toISOString()
         };
       } else {
-        // Existing event is newer
+        // Existing event is newer or equal: preserve existing state and its category
         merged = {
           ...rawEvt,
           ...existing,
-          id: existing.id
+          id: existing.id,
+          categoryId: existing.categoryId || rawEvt.categoryId
         };
       }
       resultMap.set(targetKey, merged);
@@ -626,20 +640,33 @@ function initDb(): DatabaseSchema {
       }
     };
 
-    // 2b. Preserve deleted categories (active categories are never deleted)
+    // 2b. Preserve deleted categories (active categories and event categories are never deleted)
     const activeLoadedCatIds = new Set((loadedDb.categories || []).map((c: any) => c?.id).filter(Boolean));
+    const activeEventCatIds = new Set((loadedDb.events || []).map((e: any) => e?.categoryId).filter(Boolean));
+    const allActiveCatIds = new Set([...activeLoadedCatIds, ...activeEventCatIds]);
+
     const finalDeletedCategoryIds: string[] = Array.isArray(loadedDb.deletedCategoryIds)
-      ? loadedDb.deletedCategoryIds.filter((id): id is string => typeof id === 'string' && !activeLoadedCatIds.has(id))
+      ? loadedDb.deletedCategoryIds.filter((id): id is string => typeof id === 'string' && !allActiveCatIds.has(id))
       : [];
     const finalDeletedCategorySet = new Set(finalDeletedCategoryIds);
 
-    // 3. Preserve categories or seed defaults
-    const finalCategories: Category[] = Array.isArray(loadedDb.categories) && loadedDb.categories.length > 0
-      ? loadedDb.categories.filter(c => c && c.id)
-      : SEED_CATEGORIES.filter(c => !finalDeletedCategorySet.has(c.id));
+    // 3. Preserve categories or seed defaults:
+    // Combine loaded categories and seed categories that haven't been deleted
+    const catMap = new Map<string, Category>();
+    if (Array.isArray(loadedDb.categories)) {
+      loadedDb.categories.forEach(c => {
+        if (c && c.id && !finalDeletedCategorySet.has(c.id)) {
+          catMap.set(c.id, c);
+        }
+      });
+    }
+    SEED_CATEGORIES.forEach(c => {
+      if (c && c.id && !finalDeletedCategorySet.has(c.id) && !catMap.has(c.id)) {
+        catMap.set(c.id, c);
+      }
+    });
 
-    const primaryCatId = (finalCategories[0] && finalCategories[0].id) || 'new';
-    const activeCatIds = new Set(finalCategories.map(c => c.id));
+    const finalCategories: Category[] = Array.from(catMap.values());
 
     // 4. Preserve user events, filtering out legacy demo events, deleted events, and Outlook events if no active ICS link
     const rawEvents: CalendarEvent[] = Array.isArray(loadedDb.events)
@@ -668,9 +695,9 @@ function initDb(): DatabaseSchema {
       : [];
     const finalDeletedSet = new Set(finalDeletedIds);
 
-    // Only merge SEED_EVENTS if an active Outlook ICS link is present or if they are non-Outlook events
+    // Merge SEED_EVENTS: keep non-Outlook seeds, or Outlook seeds if ICS link is active
     let allMergedEvents: CalendarEvent[] = [...rawEvents];
-    if (hasActiveOutlookIcs && Array.isArray(SEED_EVENTS) && SEED_EVENTS.length > 0) {
+    if (Array.isArray(SEED_EVENTS) && SEED_EVENTS.length > 0) {
       const existingIds = new Set(rawEvents.map(e => e.id));
       const existingExternalIds = new Set(rawEvents.map(e => e.externalEventId).filter(Boolean));
       
@@ -678,19 +705,34 @@ function initDb(): DatabaseSchema {
         if (!e || !e.id) return false;
         if (existingIds.has(e.id)) return false;
         if (e.externalEventId && existingExternalIds.has(e.externalEventId)) return false;
+        if (!hasActiveOutlookIcs && isOutlookEvent(e)) return false;
         return true;
       });
       allMergedEvents.push(...seedToAdd);
     }
 
-    // Map any event with deleted category (e.g. legacy 'client') or unknown category to primary active category
-    allMergedEvents = allMergedEvents.map(e => {
-      const isMissingOrDeletedCat = !e.categoryId || e.categoryId === 'client' || !activeCatIds.has(e.categoryId);
-      if (isMissingOrDeletedCat) {
-        return { ...e, categoryId: primaryCatId };
+    // STRICT PERSISTENCE GUARANTEE:
+    // We NEVER mutate, alter, or overwrite any event's categoryId under any circumstances!
+    // Ensure every event's category exists in finalCategories so it is properly styled
+    const catIdSet = new Set(finalCategories.map(c => c.id));
+    for (const evt of allMergedEvents) {
+      if (evt && evt.categoryId && !catIdSet.has(evt.categoryId)) {
+        const seedCat = SEED_CATEGORIES.find(c => c.id === evt.categoryId);
+        const newCatEntry: Category = seedCat || {
+          id: evt.categoryId,
+          name: evt.categoryId.charAt(0).toUpperCase() + evt.categoryId.slice(1),
+          color: 'indigo',
+          hex: '#6366F1',
+          bgClass: 'bg-indigo-50 dark:bg-indigo-950/40',
+          borderClass: 'border-indigo-200 dark:border-indigo-800',
+          textClass: 'text-indigo-700 dark:text-indigo-300',
+          badgeClass: 'bg-indigo-100 dark:bg-indigo-900 text-indigo-800 dark:text-indigo-200',
+          dotClass: 'bg-indigo-500'
+        };
+        finalCategories.push(newCatEntry);
+        catIdSet.add(evt.categoryId);
       }
-      return e;
-    });
+    }
 
     let finalEvents: CalendarEvent[] = deduplicateServerEvents(allMergedEvents, finalDeletedSet);
     if (!hasActiveOutlookIcs) {
@@ -770,8 +812,20 @@ function initDb(): DatabaseSchema {
   }
 
   const initialDb: DatabaseSchema = {
-    users: [],
-    events: Array.isArray(SEED_EVENTS) && SEED_EVENTS.length > 0 ? SEED_EVENTS : [],
+    users: [
+      {
+        id: "u_1788714177193",
+        username: "admin",
+        password: "admin123",
+        name: "admin",
+        email: "testin@gmail.com",
+        role: "admin",
+        avatarColor: "bg-indigo-600",
+        active: true,
+        createdAt: "2026-09-06T17:02:57.193Z"
+      }
+    ],
+    events: Array.isArray(SEED_EVENTS) && SEED_EVENTS.length > 0 ? [...SEED_EVENTS] : [],
     settings: {
       ...SEED_SETTINGS,
       sync: seedSync
@@ -823,14 +877,169 @@ function saveDb(dbData: DatabaseSchema) {
         outlookSyncedCount: dbData.settings.sync.outlookSyncedCount
       });
     }
+
+    // Mirror updates asynchronously to Cloud Firestore 24/7 persistent storage
+    saveDbToFirestore(dbData).catch((e) => {
+      console.warn("[Firestore Mirror Save Error]:", e?.message || e);
+    });
   } catch (err) {
     console.error("Error saving database file:", err);
+  }
+}
+
+// Global Cloud Firestore integration for 24/7 persistence
+let cloudFirestoreInstance: any = null;
+function getCloudFirestore() {
+  if (!cloudFirestoreInstance) {
+    try {
+      const app = getFirebaseApps().length > 0 ? getFirebaseApp() : initFirebaseApp(firebaseAppConfig);
+      cloudFirestoreInstance = initFirestoreDb(app, (firebaseAppConfig as any).firestoreDatabaseId);
+      console.log("[Cloud Firestore] Initialized 24/7 permanent storage engine.");
+    } catch (e) {
+      console.warn("[Cloud Firestore Initialization Warning]:", e);
+    }
+  }
+  return cloudFirestoreInstance;
+}
+
+async function saveDbToFirestore(dbData: DatabaseSchema): Promise<void> {
+  const fDb = getCloudFirestore();
+  if (!fDb) return;
+  try {
+    // 1. Persist events
+    if (Array.isArray(dbData.events)) {
+      for (const evt of dbData.events) {
+        if (evt && evt.id) {
+          await firestoreSetDoc(firestoreDoc(fDb, 'events', evt.id), {
+            ...evt,
+            cloudSyncedAt: new Date().toISOString()
+          }, { merge: true });
+        }
+      }
+    }
+
+    // 2. Clean up deleted events from Firestore (only true tombstones, never active events)
+    if (Array.isArray(dbData.deletedEventIds)) {
+      const activeIds = new Set((dbData.events || []).map(e => e.id));
+      for (const delId of dbData.deletedEventIds) {
+        if (delId && typeof delId === 'string' && !delId.startsWith('del_sig_') && !activeIds.has(delId)) {
+          await firestoreDeleteDoc(firestoreDoc(fDb, 'events', delId)).catch(() => {});
+        }
+      }
+    }
+
+    // 3. Persist categories
+    if (Array.isArray(dbData.categories)) {
+      for (const cat of dbData.categories) {
+        if (cat && cat.id) {
+          await firestoreSetDoc(firestoreDoc(fDb, 'categories', cat.id), cat, { merge: true });
+        }
+      }
+    }
+
+    // 4. Persist global settings, shares and metadata
+    await firestoreSetDoc(firestoreDoc(fDb, 'settings', 'global'), {
+      ...dbData.settings,
+      shares: dbData.shares || [],
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
+
+    // 5. Persist Anuncio PDF metadata if present
+    if (dbData.anuncioPdf) {
+      await firestoreSetDoc(firestoreDoc(fDb, 'settings', 'anuncio_pdf'), {
+        ...dbData.anuncioPdf,
+        updatedAt: new Date().toISOString()
+      }, { merge: true }).catch(() => {});
+    }
+  } catch (err: any) {
+    console.warn("[Firestore Save Failure]:", err?.message || err);
+  }
+}
+
+async function syncDbFromFirestore(targetDb: DatabaseSchema): Promise<boolean> {
+  const fDb = getCloudFirestore();
+  if (!fDb) return false;
+  try {
+    const eventsSnap = await firestoreGetDocs(firestoreCol(fDb, 'events'));
+    let changed = false;
+    if (!eventsSnap.empty) {
+      const cloudEvents: CalendarEvent[] = [];
+      eventsSnap.forEach((d) => {
+        const item = d.data() as CalendarEvent;
+        if (item && item.id) cloudEvents.push(item);
+      });
+      if (cloudEvents.length > 0) {
+        const deletedSet = new Set(targetDb.deletedEventIds || []);
+        cloudEvents.forEach(ce => {
+          if (deletedSet.has(ce.id)) deletedSet.delete(ce.id);
+        });
+        targetDb.deletedEventIds = Array.from(deletedSet);
+
+        const merged = deduplicateServerEvents([...targetDb.events, ...cloudEvents], deletedSet);
+        const prevJson = JSON.stringify(targetDb.events);
+        const mergedJson = JSON.stringify(merged);
+        if (prevJson !== mergedJson) {
+          targetDb.events = merged;
+          changed = true;
+        }
+      }
+    }
+
+    const catSnap = await firestoreGetDocs(firestoreCol(fDb, 'categories'));
+    if (!catSnap.empty) {
+      const cloudCats: Category[] = [];
+      catSnap.forEach((d) => {
+        const cat = d.data() as Category;
+        if (cat && cat.id) cloudCats.push(cat);
+      });
+      if (cloudCats.length > 0) {
+        const catMap = new Map<string, Category>((targetDb.categories || []).map(c => [c.id, c]));
+        cloudCats.forEach(c => catMap.set(c.id, c));
+        const newCats = Array.from(catMap.values());
+        if (JSON.stringify(targetDb.categories) !== JSON.stringify(newCats)) {
+          targetDb.categories = newCats;
+          changed = true;
+        }
+      }
+    }
+
+    try {
+      const anuncioPdfSnap = await firestoreGetDoc(firestoreDoc(fDb, 'settings', 'anuncio_pdf'));
+      if (anuncioPdfSnap.exists()) {
+        const cloudPdf = anuncioPdfSnap.data() as any;
+        if (cloudPdf && (cloudPdf.filename || cloudPdf.dataUrl)) {
+          if (JSON.stringify(targetDb.anuncioPdf) !== JSON.stringify(cloudPdf)) {
+            targetDb.anuncioPdf = cloudPdf;
+            changed = true;
+          }
+        }
+      }
+    } catch (e) {}
+
+    if (changed) {
+      try {
+        const jsonStr = JSON.stringify(targetDb, null, 2);
+        fs.writeFileSync(DB_FILE, jsonStr, 'utf-8');
+        fs.writeFileSync(DB_BACKUP_FILE, jsonStr, 'utf-8');
+      } catch (e) {}
+    }
+    return changed;
+  } catch (err) {
+    console.warn("[Firestore Read Sync Warning]:", err);
+    return false;
   }
 }
 
 let db = initDb();
 
 async function startServer() {
+  try {
+    await syncDbFromFirestore(db);
+    console.log(`[Firestore Server Init Sync] Ready. Synced events: ${db.events.length}, categories: ${db.categories?.length || 0}`);
+  } catch (e) {
+    console.warn("[Firestore Server Init Sync Warning]:", e);
+  }
+
   const app = express();
   const PORT = 3000;
 
@@ -848,9 +1057,9 @@ async function startServer() {
     next();
   });
 
-  app.use(express.json({ limit: '10mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-  app.use(express.text({ type: ['text/*', 'application/xml', 'application/xhtml+xml'], limit: '10mb' }));
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+  app.use(express.text({ type: ['text/*', 'application/xml', 'application/xhtml+xml'], limit: '50mb' }));
 
   // Health check endpoint
   app.get("/api/health", (req, res) => {
@@ -864,7 +1073,10 @@ async function startServer() {
   });
 
   // Full synchronization endpoint
-  app.get("/api/sync", (req, res) => {
+  app.get("/api/sync", async (req, res) => {
+    try {
+      await syncDbFromFirestore(db);
+    } catch (e) {}
     const deletedSet = new Set(db.deletedEventIds || []);
     const deletedCatSet = new Set(db.deletedCategoryIds || []);
     const deletedUserSet = new Set(db.deletedUserIds || []);
@@ -877,6 +1089,7 @@ async function startServer() {
       categories: (db.categories || SEED_CATEGORIES).filter(c => c && c.id && !deletedCatSet.has(c.id)),
       shares: db.shares || [],
       zapier: db.zapier,
+      anuncioPdf: db.anuncioPdf,
       deletedEventIds: db.deletedEventIds || [],
       deletedCategoryIds: db.deletedCategoryIds || [],
       deletedUserIds: db.deletedUserIds || []
@@ -1005,6 +1218,30 @@ async function startServer() {
     } else if (db.categories) {
       db.categories = db.categories.filter((c: Category) => c && c.id && !currentDeletedCatSet.has(c.id));
     }
+
+    // STRICT PERSISTENCE: Ensure every event category exists in db.categories and is never treated as deleted
+    const activeCatMap = new Map<string, Category>((db.categories || []).map(c => [c.id, c]));
+    (db.events || []).forEach((e) => {
+      if (e && e.categoryId && !activeCatMap.has(e.categoryId)) {
+        const seed = SEED_CATEGORIES.find(c => c.id === e.categoryId);
+        const resolved: Category = seed || {
+          id: e.categoryId,
+          name: e.categoryId.charAt(0).toUpperCase() + e.categoryId.slice(1),
+          color: 'indigo',
+          hex: '#6366F1',
+          bgClass: 'bg-indigo-50 dark:bg-indigo-950/40',
+          borderClass: 'border-indigo-200 dark:border-indigo-800',
+          textClass: 'text-indigo-700 dark:text-indigo-300',
+          badgeClass: 'bg-indigo-100 dark:bg-indigo-900 text-indigo-800 dark:text-indigo-200',
+          dotClass: 'bg-indigo-500'
+        };
+        activeCatMap.set(e.categoryId, resolved);
+        if (db.deletedCategoryIds) {
+          db.deletedCategoryIds = db.deletedCategoryIds.filter(id => id !== e.categoryId);
+        }
+      }
+    });
+    db.categories = Array.from(activeCatMap.values());
 
     if (Array.isArray(incomingShares)) {
       const shareMap = new Map<string, SharedCalendar>();
@@ -1520,6 +1757,31 @@ async function startServer() {
     }
   }
 
+  // Helper to ensure an event's category is never orphaned, deleted, or missing
+  function ensureCategoryExists(catId?: string) {
+    if (!catId) return;
+    if (db.deletedCategoryIds) {
+      db.deletedCategoryIds = db.deletedCategoryIds.filter((id) => id !== catId);
+    }
+    if (!db.categories) db.categories = [...SEED_CATEGORIES];
+    const exists = db.categories.some((c) => c && c.id === catId);
+    if (!exists) {
+      const seedCat = SEED_CATEGORIES.find((c) => c.id === catId);
+      const newCatEntry: Category = seedCat || {
+        id: catId,
+        name: catId.charAt(0).toUpperCase() + catId.slice(1),
+        color: 'indigo',
+        hex: '#6366F1',
+        bgClass: 'bg-indigo-50 dark:bg-indigo-950/40',
+        borderClass: 'border-indigo-200 dark:border-indigo-800',
+        textClass: 'text-indigo-700 dark:text-indigo-300',
+        badgeClass: 'bg-indigo-100 dark:bg-indigo-900 text-indigo-800 dark:text-indigo-200',
+        dotClass: 'bg-indigo-500'
+      };
+      db.categories.push(newCatEntry);
+    }
+  }
+
   // EVENTS REST ENDPOINTS
   app.get("/api/events", (req, res) => {
     const deletedSet = new Set(db.deletedEventIds || []);
@@ -1536,6 +1798,9 @@ async function startServer() {
     if (!db.deletedEventIds) db.deletedEventIds = [];
 
     if (Array.isArray(payload)) {
+      payload.forEach((e: any) => {
+        if (e && e.categoryId) ensureCategoryExists(e.categoryId);
+      });
       const incomingIds = new Set(payload.map((e: any) => e.id).filter(Boolean));
       if (db.deletedEventIds.length > 0) {
         db.deletedEventIds = db.deletedEventIds.filter((id) => !incomingIds.has(id));
@@ -1552,6 +1817,9 @@ async function startServer() {
       newEvt.id = `evt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     }
     newEvt.updatedAt = newEvt.updatedAt || new Date().toISOString();
+    if (newEvt.categoryId) {
+      ensureCategoryExists(newEvt.categoryId);
+    }
 
     // Re-creation or edit removes from deletedEventIds
     if (db.deletedEventIds.length > 0) {
@@ -1593,16 +1861,20 @@ async function startServer() {
     let savedEvt: CalendarEvent;
     if (index === -1) {
       // If not found, insert
-      savedEvt = { ...updates, id: evtId, updatedAt: updates.updatedAt || nowIso };
+      savedEvt = { ...updates, id: evtId, updatedAt: nowIso };
       db.events.push(savedEvt);
     } else {
       savedEvt = {
         ...db.events[index],
         ...updates,
         id: evtId,
-        updatedAt: updates.updatedAt || nowIso
+        updatedAt: nowIso
       };
       db.events[index] = savedEvt;
+    }
+
+    if (savedEvt.categoryId) {
+      ensureCategoryExists(savedEvt.categoryId);
     }
 
     // Ensure active event is not in deletedEventIds
@@ -1959,6 +2231,141 @@ async function startServer() {
   });
 
   // ==========================================
+  // ANUNCIO PDF DOCUMENT REST ENDPOINTS
+  // ==========================================
+  const ANUNCIO_PDF_DIR = path.join(process.cwd(), 'data');
+  const ANUNCIO_PDF_PATH = path.join(ANUNCIO_PDF_DIR, 'anuncio.pdf');
+
+  try {
+    if (!fs.existsSync(ANUNCIO_PDF_DIR)) {
+      fs.mkdirSync(ANUNCIO_PDF_DIR, { recursive: true });
+    }
+  } catch (e) {}
+
+  // GET Anuncio PDF file (streaming inline for browser viewing or download)
+  app.get(["/api/anuncio/pdf", "/anuncio.pdf", "/anuncios.pdf", "/public/anuncio.pdf"], (req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+
+    if (fs.existsSync(ANUNCIO_PDF_PATH)) {
+      const filename = db.anuncioPdf?.filename || 'anuncio.pdf';
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(filename)}"`);
+      return res.sendFile(ANUNCIO_PDF_PATH);
+    }
+
+    if (db.anuncioPdf?.dataUrl) {
+      const match = db.anuncioPdf.dataUrl.match(/^data:application\/pdf;base64,(.+)$/i) || db.anuncioPdf.dataUrl.match(/^data:[^;]+;base64,(.+)$/i);
+      if (match) {
+        const buffer = Buffer.from(match[1], 'base64');
+        const filename = db.anuncioPdf.filename || 'anuncio.pdf';
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(filename)}"`);
+        return res.send(buffer);
+      }
+    }
+
+    return res.status(404).json({ error: "No se ha subido ningún archivo PDF de Anuncios todavía" });
+  });
+
+  // GET Anuncio PDF metadata
+  app.get("/api/anuncio/pdf/info", (req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+
+    const hasFile = fs.existsSync(ANUNCIO_PDF_PATH) || Boolean(db.anuncioPdf?.dataUrl);
+    if (hasFile && db.anuncioPdf) {
+      let fileSize = db.anuncioPdf.fileSize || 0;
+      if (!fileSize && fs.existsSync(ANUNCIO_PDF_PATH)) {
+        try { fileSize = fs.statSync(ANUNCIO_PDF_PATH).size; } catch (e) {}
+      }
+      return res.json({
+        hasPdf: true,
+        pdf: {
+          id: db.anuncioPdf.id || 'anuncio-pdf-current',
+          filename: db.anuncioPdf.filename || 'anuncio.pdf',
+          fileSize,
+          mimeType: db.anuncioPdf.mimeType || 'application/pdf',
+          uploadedAt: db.anuncioPdf.uploadedAt || new Date().toISOString(),
+          url: '/api/anuncio/pdf'
+        }
+      });
+    }
+
+    return res.json({ hasPdf: false, pdf: null });
+  });
+
+  // POST Upload/Replace Anuncio PDF
+  app.post("/api/anuncio/pdf", async (req, res) => {
+    try {
+      const { filename, fileSize, mimeType, dataUrl } = req.body || {};
+      if (!dataUrl) {
+        return res.status(400).json({ error: "Faltan los datos del archivo PDF" });
+      }
+
+      const match = dataUrl.match(/^data:application\/pdf;base64,(.+)$/i) || dataUrl.match(/^data:[^;]+;base64,(.+)$/i);
+      if (!match) {
+        return res.status(400).json({ error: "Formato de archivo inválido. Debe ser un archivo PDF válido." });
+      }
+
+      const buffer = Buffer.from(match[1], 'base64');
+      if (!fs.existsSync(ANUNCIO_PDF_DIR)) {
+        fs.mkdirSync(ANUNCIO_PDF_DIR, { recursive: true });
+      }
+      fs.writeFileSync(ANUNCIO_PDF_PATH, buffer);
+
+      const now = new Date().toISOString();
+      db.anuncioPdf = {
+        id: `pdf-${Date.now()}`,
+        filename: filename || 'anuncio.pdf',
+        fileSize: fileSize || buffer.length,
+        mimeType: mimeType || 'application/pdf',
+        dataUrl,
+        uploadedAt: now,
+        updatedAt: now
+      };
+
+      saveDb(db);
+      saveDbToFirestore(db).catch(() => {});
+
+      return res.json({
+        success: true,
+        pdf: {
+          id: db.anuncioPdf.id,
+          filename: db.anuncioPdf.filename,
+          fileSize: db.anuncioPdf.fileSize,
+          mimeType: db.anuncioPdf.mimeType,
+          uploadedAt: db.anuncioPdf.uploadedAt,
+          url: '/api/anuncio/pdf'
+        }
+      });
+    } catch (err: any) {
+      console.error("Error saving Anuncio PDF:", err);
+      return res.status(500).json({ error: err.message || "Error al procesar el archivo PDF" });
+    }
+  });
+
+  // DELETE Anuncio PDF
+  app.delete("/api/anuncio/pdf", async (req, res) => {
+    try {
+      db.anuncioPdf = undefined;
+      if (fs.existsSync(ANUNCIO_PDF_PATH)) {
+        try {
+          fs.unlinkSync(ANUNCIO_PDF_PATH);
+        } catch (e) {}
+      }
+      saveDb(db);
+      const fDb = getCloudFirestore();
+      if (fDb) {
+        firestoreDeleteDoc(firestoreDoc(fDb, 'settings', 'anuncio_pdf')).catch(() => {});
+      }
+      return res.json({ success: true, message: "Archivo PDF eliminado correctamente" });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || "Error al eliminar el archivo PDF" });
+    }
+  });
+
+  // ==========================================
   // SHARED CALENDARS REST ENDPOINTS
   // ==========================================
 
@@ -2190,30 +2597,194 @@ async function startServer() {
 
   // PUBLIC: Get category metadata and scheduled events for QR / PDF browser viewing (No login required)
   app.get("/api/public/category/:categoryId", (req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Cache-Control, Pragma");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+
     const { categoryId } = req.params;
     const cleanId = (categoryId || '').trim();
     if (!cleanId) {
       return res.status(400).json({ error: "Missing category ID" });
     }
 
-    const categories = db.categories || SEED_CATEGORIES;
-    const category = categories.find(
-      (c) => c.id.toLowerCase() === cleanId.toLowerCase() || c.name.toLowerCase() === cleanId.toLowerCase()
-    );
-
-    if (!category) {
-      return res.status(404).json({ error: `Category "${cleanId}" not found.` });
+    let currentDb = db;
+    try {
+      currentDb = initDb();
+    } catch (e) {
+      currentDb = db;
     }
 
-    const matchingEvents = (db.events || []).filter((e) => e.categoryId === category.id);
+    const categories = currentDb.categories || SEED_CATEGORIES;
+    const isAll =
+      cleanId.toLowerCase() === 'all' ||
+      cleanId.toLowerCase() === 'overview' ||
+      cleanId.toLowerCase() === 'sacramentos';
+
+    const category = isAll
+      ? {
+          id: 'all',
+          name: 'SACRAMENTOS',
+          hex: '#4f46e5',
+          color: 'indigo',
+          bgClass: 'bg-indigo-50 dark:bg-indigo-950/40',
+          borderClass: 'border-indigo-200 dark:border-indigo-800',
+          textClass: 'text-indigo-700 dark:text-indigo-300',
+          badgeClass: 'bg-indigo-100 dark:bg-indigo-900 text-indigo-800 dark:text-indigo-200',
+          dotClass: 'bg-indigo-500',
+          description: 'Master consolidated calendar combining all categories'
+        }
+      : categories.find(
+          (c) =>
+            c.id.toLowerCase() === cleanId.toLowerCase() ||
+            c.name.toLowerCase() === cleanId.toLowerCase()
+        );
+
+    if (!category) {
+      return res.status(404).json({
+        error: `Category "${cleanId}" not found.`,
+        availableCategories: categories.map((c) => ({ id: c.id, name: c.name }))
+      });
+    }
+
+    let allEvents = currentDb.events || [];
+
+    // Support optional packed event payload (?d=...)
+    const queryData = (req.query.d as string) || (req.query.data as string) || (req.query.payload as string);
+    if (queryData) {
+      try {
+        let b64 = decodeURIComponent(queryData).trim().replace(/-/g, '+').replace(/_/g, '/');
+        while (b64.length % 4) b64 += '=';
+        const decoded = Buffer.from(b64, 'base64').toString('utf-8');
+        const parsed = JSON.parse(decoded);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const queryEvents: CalendarEvent[] = parsed.map((item: any) => ({
+            id: item.i || `evt-q-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            title: item.t || 'Event',
+            startDate: item.sd || item.s || '',
+            endDate: item.ed || item.e || item.sd || item.s || '',
+            startTime: item.st || '',
+            endTime: item.et || '',
+            categoryId: item.c || cleanId,
+            location: item.l || '',
+            description: item.d || '',
+            notes: '',
+            isAllDay: Boolean(item.ad),
+            userId: 'qr_scanner',
+            createdBy: 'Organizers'
+          }));
+          const deletedSet = new Set(currentDb.deletedEventIds || []);
+          allEvents = deduplicateServerEvents([...allEvents, ...queryEvents], deletedSet);
+          currentDb.events = allEvents;
+          saveDb(currentDb);
+        }
+      } catch (e) {}
+    }
+
+    const matchingEvents = isAll
+      ? allEvents
+      : allEvents.filter(
+          (e) =>
+            e.categoryId === category.id ||
+            (e.categoryId && e.categoryId.toLowerCase() === category.id.toLowerCase())
+        );
 
     return res.json({
       success: true,
       category,
-      categories: categories,
+      categories,
       events: matchingEvents,
-      settings: db.settings
+      settings: currentDb.settings || {}
     });
+  });
+
+  // PUBLIC: Direct iCalendar (.ics) download for mobile phone calendar import (iPhone / Apple Calendar / Android / Outlook)
+  app.get(["/public/category/:categoryId/calendar.ics", "/api/calendar/category/:categoryId.ics"], (req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    const cleanId = (req.params.categoryId || '').trim();
+    const currentDb = initDb();
+    const categories = currentDb.categories || [];
+    const isAll = cleanId.toLowerCase() === 'all' || cleanId.toLowerCase() === 'overview' || cleanId.toLowerCase() === 'sacramentos';
+    const category = isAll
+      ? { id: 'all', name: 'Sacramentos' }
+      : categories.find((c: any) => c.id.toLowerCase() === cleanId.toLowerCase() || c.name.toLowerCase() === cleanId.toLowerCase());
+
+    const catName = category ? category.name : 'Church Schedule';
+    const allEvents = currentDb.events || [];
+    const matchingEvents = isAll
+      ? allEvents
+      : allEvents.filter((e: any) => e.categoryId === (category?.id || cleanId) || (e.categoryId && e.categoryId.toLowerCase() === (category?.id || cleanId).toLowerCase()));
+
+    const dtstamp = new Date().toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+    let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Church Ministry Schedule//ExecutiveSync//EN\r\nCALSCALE:GREGORIAN\r\nMETHOD:PUBLISH\r\nX-WR-CALNAME:" + catName.replace(/[\r\n]/g, ' ') + "\r\n";
+
+    matchingEvents.forEach((e: any) => {
+      if (!e.startDate) return;
+      const sDate = e.startDate.replace(/[-/]/g, '').trim();
+      if (sDate.length < 8) return;
+      const uid = (e.id || Math.random().toString(36).substring(2)) + "@calendar";
+      ics += "BEGIN:VEVENT\r\nUID:" + uid + "\r\nDTSTAMP:" + dtstamp + "\r\n";
+      ics += "SUMMARY:" + (e.title || 'Event').replace(/[\r\n]/g, ' ') + "\r\n";
+      if (e.isAllDay) {
+        const parts = e.startDate.split(/[-/]/).map(Number);
+        const d = new Date(parts[0], parts[1] - 1, parts[2] + 1);
+        const nextD = d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+        ics += "DTSTART;VALUE=DATE:" + sDate + "\r\n";
+        ics += "DTEND;VALUE=DATE:" + nextD + "\r\n";
+      } else {
+        const sTime = (e.startTime || '09:00').replace(/:/g, '').slice(0, 4) + '00';
+        const eTime = e.endTime
+          ? e.endTime.replace(/:/g, '').slice(0, 4) + '00'
+          : (parseInt(sTime.slice(0, 2), 10) + 1).toString().padStart(2, '0') + sTime.slice(2);
+        const eDate = (e.endDate || e.startDate || '').replace(/[-/]/g, '').trim();
+        ics += "DTSTART:" + sDate + "T" + sTime + "\r\n";
+        ics += "DTEND:" + eDate + "T" + eTime + "\r\n";
+      }
+      const descParts = [];
+      if (e.description) descParts.push(e.description);
+      if (e.notes) descParts.push('Notes: ' + e.notes);
+      if (descParts.length > 0) {
+        ics += "DESCRIPTION:" + descParts.join('\\n').replace(/[\r\n]/g, ' ') + "\r\n";
+      }
+      if (e.location) {
+        ics += "LOCATION:" + e.location.replace(/[\r\n]/g, ' ') + "\r\n";
+      }
+      ics += "STATUS:CONFIRMED\r\nTRANSP:OPAQUE\r\nEND:VEVENT\r\n";
+    });
+    ics += "END:VCALENDAR\r\n";
+
+    const safeFilename = catName.toLowerCase().replace(/[^a-z0-9]/g, '_') + '.ics';
+    res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    return res.send(ics);
+  });
+
+  // PUBLIC: Get all events without requiring authentication/session
+  app.get("/api/public/events", async (req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    try {
+      await syncDbFromFirestore(db);
+    } catch (e) {}
+    const deletedSet = new Set(db.deletedEventIds || []);
+    const cleanEvents = deduplicateServerEvents(db.events || [], deletedSet);
+    return res.json(cleanEvents);
+  });
+
+  // PUBLIC: Get all categories without requiring authentication/session
+  app.get("/api/public/categories", async (req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    try {
+      await syncDbFromFirestore(db);
+    } catch (e) {}
+    return res.json(db.categories || SEED_CATEGORIES);
   });
 
   // ==========================================
@@ -2882,7 +3453,10 @@ async function startServer() {
       return ymStr;
     };
 
-    const isAll = category.id === 'all' || category.id === 'overview';
+    const isAll = category.id === 'all' || category.id === 'overview' || category.id === 'sacramentos' || (category.name && (category.name.toLowerCase().includes('all') || category.name.toLowerCase().includes('overview') || category.name.toLowerCase().includes('sacramentos')));
+    if (isAll) {
+      category.name = 'Sacramentos';
+    }
     const categoriesMap = new Map((allCategories || []).map((c: any) => [c.id, c]));
 
     // Determine initial month on server so HTML is pre-rendered immediately for any scanner or browser
@@ -2908,6 +3482,134 @@ async function startServer() {
 
     const initialMonthEvents = sortedEvents.filter(e => (e.startDate || '').startsWith(initialMonth));
     const availableMonths = Array.from(new Set(sortedEvents.map(e => (e.startDate || '').slice(0, 7)).filter(Boolean))).sort();
+
+    const getGoogleCalUrl = (evt: any): string => {
+      const title = encodeURIComponent(evt.title || 'Church Event');
+      const desc = encodeURIComponent([evt.description, evt.notes ? `Notes: ${evt.notes}` : ''].filter(Boolean).join('\n\n'));
+      const loc = encodeURIComponent(evt.location || '');
+      const sDate = (evt.startDate || '').replace(/-/g, '');
+      const sTime = evt.isAllDay ? '' : ((evt.startTime || '09:00').replace(/:/g, '').slice(0, 4) + '00');
+      let dates = '';
+      if (evt.isAllDay) {
+        const p = (evt.startDate || '').split('-').map(Number);
+        const nextD = new Date(p[0], p[1] - 1, p[2] + 1);
+        const eDate = nextD.getFullYear() + String(nextD.getMonth() + 1).padStart(2, '0') + String(nextD.getDate()).padStart(2, '0');
+        dates = `${sDate}/${eDate}`;
+      } else {
+        const eDate = (evt.endDate || evt.startDate || '').replace(/-/g, '');
+        const eTime = evt.endTime
+          ? evt.endTime.replace(/:/g, '').slice(0, 4) + '00'
+          : (parseInt(sTime.slice(0, 2), 10) + 1).toString().padStart(2, '0') + sTime.slice(2);
+        dates = `${sDate}T${sTime}/${eDate}T${eTime}`;
+      }
+      return `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${title}&dates=${dates}&details=${desc}&location=${loc}`;
+    };
+
+    // Quick 12-month selector pills
+    const activeYear = parseInt(initialMonth.split('-')[0], 10) || new Date().getFullYear();
+    let monthPillsHtml = '<div id="quickMonthsBarContainer" class="quick-months-bar no-print">';
+    for (let m = 1; m <= 12; m++) {
+      const ym = `${activeYear}-${String(m).padStart(2, '0')}`;
+      const mName = new Date(activeYear, m - 1, 1).toLocaleDateString('en-US', { month: 'short' });
+      const evtCount = sortedEvents.filter(e => (e.startDate || '').startsWith(ym)).length;
+      const isAct = ym === initialMonth;
+      monthPillsHtml += `<button type="button" class="quick-month-btn${isAct ? ' active' : ''}" data-ym="${ym}" onclick="setMonth('${ym}')"><span>${mName}</span>${evtCount > 0 ? `<span class="pill-badge">${evtCount}</span>` : ''}</button>`;
+    }
+    monthPillsHtml += '</div>';
+
+    // Anuncio PDF Section (Unified: Events + Anuncio PDF in one place)
+    const hasAnuncioPdf = Boolean(db.anuncioPdf);
+    let anuncioSectionHtml = '';
+    if (isAll) {
+      if (hasAnuncioPdf && db.anuncioPdf) {
+        const pdf = db.anuncioPdf;
+        const fileSizeMb = pdf.fileSize ? (pdf.fileSize / (1024 * 1024)).toFixed(1) : '1.5';
+        anuncioSectionHtml = `
+      <!-- View Mode Selector (All in One: Events + Anuncio PDF) -->
+      <div class="view-tabs-container no-print" id="unifiedViewTabs">
+        <button type="button" class="view-tab-btn active" id="tabAllInOne" onclick="switchUnifiedView('all-in-one')">
+          <span>Todo</span>
+        </button>
+        <button type="button" class="view-tab-btn" id="tabEventsOnly" onclick="switchUnifiedView('events-only')">
+          <span>📅 Solo Calendario</span>
+        </button>
+        <button type="button" class="view-tab-btn" id="tabPdfOnly" onclick="switchUnifiedView('pdf-only')">
+          <span>📄 Solo Anuncio PDF</span>
+        </button>
+      </div>
+
+      <!-- Anuncio PDF Card Container -->
+      <div class="anuncio-unified-card" id="anuncioUnifiedCard">
+        <div class="anuncio-header">
+          <div class="anuncio-title">
+            <span style="font-size: 18px;">📄</span>
+            <span>Anuncio Parroquial / Boletín</span>
+          </div>
+          <div class="anuncio-actions no-print">
+            <a href="/api/anuncio/pdf" target="_blank" rel="noopener noreferrer" class="btn-anuncio-action" title="Abrir en pantalla completa">
+              <span>🔍</span> Pantalla Completa
+            </a>
+          </div>
+        </div>
+        <div class="anuncio-pdf-wrapper">
+          <iframe src="/api/anuncio/pdf#toolbar=1" id="anuncioPdfIframe" class="anuncio-pdf-iframe" title="Anuncio PDF"></iframe>
+          <div class="anuncio-pdf-mobile-fallback no-print">
+            <p style="margin: 0 0 8px 0; font-size: 13px; color: #475569;">¿Prefieres ver el documento PDF en pantalla completa?</p>
+            <a href="/api/anuncio/pdf" target="_blank" rel="noopener noreferrer" class="btn-anuncio-action" style="background: #4f46e5; border-color: #4338ca; color: #ffffff; display: inline-flex;">
+              📄 Abrir PDF de Anuncios
+            </a>
+          </div>
+        </div>
+      </div>
+      `;
+      } else {
+        const firstAnnouncement = db.announcements?.[0] || DEFAULT_ANNOUNCEMENT;
+        anuncioSectionHtml = `
+      <!-- View Mode Selector (All in One: Events + Anuncio PDF) -->
+      <div class="view-tabs-container no-print" id="unifiedViewTabs">
+        <button type="button" class="view-tab-btn active" id="tabAllInOne" onclick="switchUnifiedView('all-in-one')">
+          <span>Todo</span>
+        </button>
+        <button type="button" class="view-tab-btn" id="tabEventsOnly" onclick="switchUnifiedView('events-only')">
+          <span>📅 Solo Calendario</span>
+        </button>
+        <button type="button" class="view-tab-btn" id="tabPdfOnly" onclick="switchUnifiedView('pdf-only')">
+          <span>📄 Solo Anuncios</span>
+        </button>
+      </div>
+
+      <!-- Anuncio Unified Card -->
+      <div class="anuncio-unified-card" id="anuncioUnifiedCard">
+        <div class="anuncio-header">
+          <div class="anuncio-title">
+            <span style="font-size: 18px;">📢</span>
+            <span>Anuncios Parroquiales & Boletín:</span>
+            <span style="color: #fef08a; font-weight: 800;">${escapeHtml(firstAnnouncement?.title || 'Boletín Parroquial')}</span>
+          </div>
+          <div class="anuncio-actions no-print">
+            <a href="/?view=anuncios" class="btn-anuncio-action" title="Abrir gestión de Anuncios">
+              <span>📋</span> Ver Tablón de Anuncios
+            </a>
+          </div>
+        </div>
+        <div style="padding: 24px 20px; background: #ffffff; color: #1e293b;">
+          <div style="max-width: 600px; margin: 0 auto; text-align: center;">
+            <div style="display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: 12px; background: #e0e7ff; color: #4338ca; font-size: 22px; margin-bottom: 12px;">📄</div>
+            <h3 style="margin: 0 0 8px 0; font-size: 17px; font-weight: 800; color: #0f172a;">${escapeHtml(firstAnnouncement?.title || 'Anuncios Parroquiales & Sacramentos')}</h3>
+            <p style="margin: 0 0 14px 0; font-size: 13.5px; line-height: 1.5; color: #475569;">
+              ${escapeHtml(firstAnnouncement?.subtitle || (firstAnnouncement as any)?.description || 'Consulta las fechas de celebraciones, intenciones de misa y avisos parroquiales vinculados con el calendario de Sacramentos.')}
+            </p>
+            <div style="display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;">
+              <a href="/?view=anuncios" class="btn-anuncio-action no-print" style="background: #4f46e5; border-color: #4338ca; color: #ffffff; padding: 8px 16px; font-size: 13px;">
+                <span>📋</span> Ver Anuncios Completos
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+      `;
+      }
+    }
 
     // Pre-render Mini Calendar HTML
     const parts = initialMonth.split('-');
@@ -2954,7 +3656,7 @@ async function startServer() {
       let cellClasses = 'mini-cal-cell';
       if (count > 0) cellClasses += ' has-events';
       if (isTodayDate) cellClasses += ' today-cell';
-      preRenderedMiniCalHtml += `<div class="${cellClasses}" onclick="toggleDayFilter('${dStr}')"><span>${d}</span>${count > 0 ? `<span class="mini-cal-dot" style="background:${escapeHtml(category.hex || '#4f46e5')};"></span>` : ''}</div>`;
+      preRenderedMiniCalHtml += `<div class="${cellClasses}" data-date="${dStr}" onclick="toggleDayFilter('${dStr}')"><span>${d}</span>${count > 0 ? `<span class="mini-cal-dot" style="background:${escapeHtml(category.hex || '#4f46e5')};"></span>` : ''}</div>`;
     }
     preRenderedMiniCalHtml += `</div></div>`;
 
@@ -3005,20 +3707,40 @@ async function startServer() {
           const cat = categoriesMap.get(evt.categoryId) || { hex: category.hex || '#4f46e5' };
           const evtColor = cat.hex || category.hex || '#4f46e5';
           let noteSnippet = '';
-          const notesText = evt.notes || evt.description || '';
+          const notesText = evt.notes || '';
           if (notesText && notesText.trim()) {
             noteSnippet = `<div style="font-size: 12px; color: #64748b; margin-top: 4px; line-height: 1.4;">📝 ${escapeHtml(notesText)}</div>`;
+          }
+          let locSnippet = '';
+          if (evt.location && evt.location.trim()) {
+            locSnippet = `<div class="event-location">📍 <span>${escapeHtml(evt.location)}</span></div>`;
+          }
+          let descSnippet = '';
+          if (evt.description && evt.description.trim() && evt.description.trim() !== notesText.trim()) {
+            descSnippet = `<div style="font-size: 12px; color: #64748b; margin-top: 3px; font-style: italic;">${escapeHtml(evt.description)}</div>`;
           }
 
           preRenderedEventsHtml += `
             <div class="event-row" style="border-left: 4px solid ${escapeHtml(evtColor)};">
               <div style="flex:1;">
                 <h3 class="event-title">${escapeHtml(evt.title || 'Untitled Event')}</h3>
+                ${locSnippet}
+                ${descSnippet}
                 ${noteSnippet}
               </div>
               <div class="event-datetime">
-                <span class="event-date">${escapeHtml(dateFormatted)}</span>
-                <span class="event-time">⏰ ${escapeHtml(timeDisplay)}</span>
+                <div style="display: flex; align-items: center; gap: 8px; justify-content: flex-end;">
+                  <span class="event-date">${escapeHtml(dateFormatted)}</span>
+                  <span class="event-time">⏰ ${escapeHtml(timeDisplay)}</span>
+                </div>
+                <div class="event-cal-actions no-print">
+                  <button type="button" class="event-cal-btn" onclick="addSingleEventToIcs('${escapeHtml(evt.id || '')}'); return false;" title="Add to iPhone or Android Calendar (.ics)">
+                    📱 Add to Phone
+                  </button>
+                  <a href="${getGoogleCalUrl(evt)}" target="_blank" rel="noopener noreferrer" class="event-cal-btn google" title="Add to Google Calendar">
+                    📅 Google Calendar
+                  </a>
+                </div>
               </div>
             </div>
           `;
@@ -3039,6 +3761,10 @@ async function startServer() {
         if (!e.isAllDay && e.startTime) {
           timeStr = ' • ' + formatTime12h(e.startTime);
         }
+        let noteLoc = '';
+        if (e.location && e.location.trim()) {
+          noteLoc = `<div class="event-location" style="margin-top:2px;">📍 <span>${escapeHtml(e.location)}</span></div>`;
+        }
         const notesContent = e.notes || e.description || '';
         preRenderedNotesHtml += `
           <div class="note-card">
@@ -3046,6 +3772,7 @@ async function startServer() {
               <span class="note-event-title">${escapeHtml(e.title)}</span>
               <span class="note-event-date">${escapeHtml(dateFormatted + timeStr)}</span>
             </div>
+            ${noteLoc}
             <div class="note-card-body">${escapeHtml(notesContent)}</div>
           </div>
         `;
@@ -3067,6 +3794,7 @@ async function startServer() {
           categoryId: e.categoryId || '',
           categoryName: cat.name || '',
           categoryHex: cat.hex || '#6366f1',
+          location: e.location || '',
           notes: e.notes || e.description || '',
           description: e.description || ''
         };
@@ -3083,27 +3811,38 @@ async function startServer() {
 
     const safeCategoryName = escapeHtml((category.name || 'category').trim().replace(/[^a-zA-Z0-9_-]/g, '_'));
 
-    const qrBlockHtml = qrDataUrl ? `
-      <div class="doc-header-qr no-print" style="display: flex; align-items: center; gap: 8px; margin-left: 12px; padding: 4px 8px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px;">
-        <img src="${qrDataUrl}" alt="Scan QR Code" style="width: 48px; height: 48px; border-radius: 6px; display: block;" />
-        <div style="font-size: 10px; line-height: 1.25; color: #64748b;">
-          <strong style="color: #0f172a; display: block;">Public QR Link</strong>
-          <span>Scan on any phone</span>
-        </div>
-      </div>
-    ` : '';
+    const qrBlockHtml = '';
 
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${escapeHtml(category.name)} Schedule</title>
+  <title>${isAll ? 'Sacramentos' : escapeHtml(category.name + ' Schedule')}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
   <style>
     * { box-sizing: border-box; }
+    /* Clean layout for external hosting / preview containers (e.g. dpaste, iframe, or direct view) */
+    html, body {
+      background-color: #f8fafc !important;
+    }
+    #container {
+      max-width: 100% !important;
+      padding: 0 !important;
+      margin: 0 !important;
+      background: #f8fafc !important;
+    }
+    .messages, .info, .topbuttons, header, nav, #container > a, .ethical-ads, .ea-placement {
+      display: none !important;
+    }
+    div[style*="border: 2px dashed #eee"], div[style*="background: #333"], div[style*="background:#333"] {
+      border: none !important;
+      background: transparent !important;
+      padding: 0 !important;
+      margin: 0 !important;
+    }
     body {
       margin: 0;
       padding: 0;
@@ -3250,10 +3989,15 @@ async function startServer() {
       border-color: #cbd5e1;
       cursor: pointer;
       box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: rgba(79, 70, 229, 0.2);
     }
     .mini-cal-cell.has-events:hover {
       border-color: #4f46e5;
       background: #eef2ff;
+    }
+    .mini-cal-cell.has-events:active {
+      transform: scale(0.94);
     }
     .mini-cal-cell.active-day {
       background: #4f46e5 !important;
@@ -3294,12 +4038,224 @@ async function startServer() {
       margin: 0;
       line-height: 1.4;
     }
+    .event-location {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 12px;
+      font-weight: 600;
+      color: #334155;
+      margin-top: 3px;
+      line-height: 1.3;
+    }
     .event-datetime {
       display: flex;
-      align-items: center;
-      gap: 10px;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 6px;
       text-align: right;
       flex-shrink: 0;
+    }
+    .event-cal-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      justify-content: flex-end;
+    }
+    .event-cal-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-size: 10.5px;
+      font-weight: 700;
+      cursor: pointer;
+      text-decoration: none;
+      background: #ffffff;
+      color: #334155;
+      border: 1px solid #cbd5e1;
+      transition: all 0.12s ease;
+      user-select: none;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.02);
+      line-height: 1.2;
+    }
+    .event-cal-btn:hover {
+      background: #f8fafc;
+      border-color: #94a3b8;
+      color: #0f172a;
+    }
+    .event-cal-btn:active {
+      transform: scale(0.96);
+    }
+    .event-cal-btn.google {
+      background: #eff6ff;
+      color: #1d4ed8;
+      border-color: #bfdbfe;
+    }
+    .event-cal-btn.google:hover {
+      background: #dbeafe;
+    }
+
+    .quick-months-bar {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      padding-bottom: 8px;
+      margin-bottom: 16px;
+      -webkit-overflow-scrolling: touch;
+    }
+    .quick-month-btn {
+      padding: 6px 12px;
+      border-radius: 9999px;
+      font-size: 11px;
+      font-weight: 700;
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      color: #334155;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      white-space: nowrap;
+      flex-shrink: 0;
+      transition: all 0.1s ease;
+    }
+    .quick-month-btn:hover {
+      background: #f1f5f9;
+      border-color: #94a3b8;
+    }
+    .quick-month-btn.active {
+      background: #4f46e5;
+      color: #ffffff;
+      border-color: #4f46e5;
+    }
+    .pill-badge {
+      font-size: 9px;
+      padding: 1px 5px;
+      border-radius: 9999px;
+      background: rgba(0,0,0,0.08);
+    }
+    .quick-month-btn.active .pill-badge {
+      background: rgba(255,255,255,0.25);
+      color: #ffffff;
+    }
+
+    .cal-modal-backdrop {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.6);
+      backdrop-filter: blur(4px);
+      z-index: 99999;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    .cal-modal-backdrop.open {
+      display: flex;
+    }
+    .cal-modal-box {
+      background: #ffffff;
+      border-radius: 20px;
+      max-width: 460px;
+      width: 100%;
+      padding: 24px;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+      border: 1px solid #e2e8f0;
+      text-align: left;
+    }
+    .cal-modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+    .cal-modal-header h3 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 800;
+      color: #0f172a;
+    }
+    .cal-modal-close {
+      background: #f1f5f9;
+      border: 1px solid #cbd5e1;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      font-size: 14px;
+      font-weight: 700;
+      color: #475569;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .cal-modal-close:hover {
+      background: #e2e8f0;
+      color: #0f172a;
+    }
+    .cal-modal-subtitle {
+      font-size: 13px;
+      color: #64748b;
+      margin: 0 0 16px 0;
+    }
+    .cal-modal-options {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+    .cal-modal-btn {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      text-align: left;
+      border: 1px solid #cbd5e1;
+      background: #f8fafc;
+      color: #0f172a;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      touch-action: manipulation;
+      text-decoration: none;
+    }
+    .cal-modal-btn:hover {
+      background: #f1f5f9;
+      border-color: #94a3b8;
+    }
+    .cal-modal-btn .icon {
+      font-size: 22px;
+      flex-shrink: 0;
+    }
+    .cal-modal-btn strong {
+      display: block;
+      font-size: 13.5px;
+      font-weight: 700;
+      color: #0f172a;
+    }
+    .cal-modal-btn small {
+      display: block;
+      font-size: 11.5px;
+      color: #64748b;
+    }
+    .cal-modal-btn.phone {
+      border-color: #93c5fd;
+      background: #eff6ff;
+    }
+    .cal-modal-btn.phone:hover {
+      background: #dbeafe;
+    }
+    .cal-modal-tip {
+      font-size: 11px;
+      color: #64748b;
+      background: #f8fafc;
+      border-radius: 8px;
+      padding: 8px 10px;
+      border: 1px solid #e2e8f0;
+      line-height: 1.4;
     }
     .event-date {
       font-size: 12px;
@@ -3480,14 +4436,17 @@ async function startServer() {
     .btn-print-schedule {
       display: inline-flex;
       align-items: center;
-      gap: 4px;
-      font-size: 12px;
-      font-weight: 700;
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      min-width: 34px;
+      min-height: 34px;
+      font-size: 15px;
       color: #ffffff;
       background: #4f46e5;
       border: 1px solid #4338ca;
       border-radius: 10px;
-      padding: 6px 14px;
+      padding: 0;
       cursor: pointer;
       transition: all 0.15s ease;
     }
@@ -3496,6 +4455,120 @@ async function startServer() {
     }
     .print-only {
       display: none;
+    }
+
+    /* Anuncio PDF Unified Section Styles */
+    .view-tabs-container {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 20px;
+      background: #f1f5f9;
+      padding: 4px;
+      border-radius: 12px;
+      border: 1px solid #e2e8f0;
+      overflow-x: auto;
+    }
+    .view-tab-btn {
+      flex: 1;
+      min-width: 150px;
+      padding: 9px 16px;
+      border-radius: 9px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #475569;
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+    .view-tab-btn:hover {
+      color: #0f172a;
+      background: rgba(255, 255, 255, 0.6);
+    }
+    .view-tab-btn.active {
+      background: #ffffff;
+      color: #4f46e5;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+    }
+    .anuncio-unified-card {
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      border-radius: 16px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.06);
+      margin-bottom: 24px;
+      overflow: hidden;
+    }
+    .anuncio-header {
+      padding: 12px 18px;
+      background: linear-gradient(135deg, #312e81 0%, #4338ca 50%, #4f46e5 100%);
+      color: #ffffff;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .anuncio-title {
+      font-size: 14.5px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .anuncio-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .btn-anuncio-action {
+      font-size: 12px;
+      font-weight: 700;
+      padding: 6px 12px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.18);
+      color: #ffffff;
+      text-decoration: none;
+      border: 1px solid rgba(255, 255, 255, 0.35);
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .btn-anuncio-action:hover {
+      background: rgba(255, 255, 255, 0.3);
+      color: #ffffff;
+      border-color: rgba(255, 255, 255, 0.6);
+    }
+    .anuncio-pdf-wrapper {
+      position: relative;
+      background: #f8fafc;
+    }
+    .anuncio-pdf-iframe {
+      width: 100%;
+      height: 650px;
+      border: none;
+      display: block;
+      background: #ffffff;
+    }
+    @media (max-width: 640px) {
+      .anuncio-pdf-iframe {
+        height: 480px;
+      }
+    }
+    .anuncio-pdf-mobile-fallback {
+      padding: 12px 16px;
+      background: #f8fafc;
+      border-top: 1px solid #e2e8f0;
+      text-align: center;
     }
 
     @media print {
@@ -3508,6 +4581,7 @@ async function startServer() {
       .document-sheet { border: none !important; box-shadow: none !important; padding: 0 !important; border-radius: 0 !important; }
       .mini-cal-card { background: #ffffff !important; border: 1px solid #cbd5e1 !important; }
       .event-row { border: 1px solid #cbd5e1 !important; border-left: 4px solid ${escapeHtml(category.hex || '#000000')} !important; margin-bottom: 6px !important; padding: 10px 14px !important; }
+      .event-location { color: #0f172a !important; font-weight: 600 !important; font-size: 10.5pt !important; display: block !important; margin-top: 2px !important; }
       @page { margin: 15mm; size: auto; }
     }
     @media (max-width: 640px) {
@@ -3534,41 +4608,82 @@ async function startServer() {
             <span class="live-sync-dot"></span>
             <span id="liveSyncText">Live Schedule</span>
           </div>
-          <button onclick="fetchLatestLiveEvents(true)" class="btn-refresh-schedule" title="Check for live updates">
+          <button type="button" onclick="fetchLatestLiveEvents(true)" class="btn-refresh-schedule" title="Check for live updates">
             <span id="refreshIcon">&#8635;</span> Refresh
           </button>
-          <a href="/pdf/${encodeURIComponent(category.id)}/calendar.ics" class="btn-refresh-schedule" style="text-decoration: none;" title="Add these events to your phone's Calendar (Apple / Google / Outlook)">
-            📅 Add to Calendar
-          </a>
-          <button onclick="window.print()" class="btn-print-schedule" title="Print or save as PDF">
-            🖨️ Print / Save PDF
+          <button type="button" onclick="window.print()" class="btn-print-schedule" title="Print or save as PDF" aria-label="Print or save as PDF">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"></polyline><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path><rect x="6" y="14" width="12" height="8"></rect></svg>
           </button>
+        </div>
+      </div>
+
+      <!-- Add to Calendar Modal Dialog -->
+      <div id="calendarModal" class="cal-modal-backdrop" onclick="closeCalendarExportModal(event)">
+        <div class="cal-modal-box" onclick="event.stopPropagation()">
+          <div class="cal-modal-header">
+            <h3>📅 Add to Calendar</h3>
+            <button type="button" class="cal-modal-close" onclick="closeCalendarExportModal()">✕</button>
+          </div>
+          <p class="cal-modal-subtitle">Sync or add events to your iPhone, Android, or Google Calendar:</p>
+          
+          <div class="cal-modal-options">
+            <button type="button" class="cal-modal-btn phone" onclick="downloadAllEventsIcs(false)">
+              <span class="icon">📱</span>
+              <div>
+                <strong>Add All Events to Phone (.ics)</strong>
+                <small>Apple Calendar (iPhone/iPad), Android, Samsung, Outlook</small>
+              </div>
+            </button>
+
+            <button type="button" class="cal-modal-btn" onclick="downloadAllEventsIcs(true)">
+              <span class="icon">📆</span>
+              <div>
+                <strong>Add Current Month Only (.ics)</strong>
+                <small>Import only the events for the month currently selected</small>
+              </div>
+            </button>
+
+            <button type="button" class="cal-modal-btn" onclick="openUpcomingInGoogle()">
+              <span class="icon">🌐</span>
+              <div>
+                <strong>Add Next Event to Google Calendar</strong>
+                <small>Opens Google Calendar to save the next scheduled event</small>
+              </div>
+            </button>
+          </div>
+          
+          <div class="cal-modal-tip">
+            💡 <strong>Tip for Phone users:</strong> Tapping "Add All Events to Phone (.ics)" downloads the calendar file which your phone prompts to "Add All Events" directly into your built-in Apple or Android Calendar.
+          </div>
         </div>
       </div>
 
       <div class="print-only doc-print-header" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #0f172a; padding-bottom: 12px; margin-bottom: 16px;">
         <div>
-          <h1 style="margin: 0 0 4px 0; font-size: 20pt; color: #000;">${escapeHtml(category.name)} Schedule</h1>
-          <div style="font-size: 10pt; color: #475569;">Real-Time Church Calendar • Scan QR Code to view latest updates on any phone</div>
+          <h1 style="margin: 0 0 4px 0; font-size: 20pt; color: #000;">${isAll ? 'Sacramentos' : escapeHtml(category.name + ' Schedule')}</h1>
         </div>
-        ${qrDataUrl ? `
-          <div style="text-align: center;">
-            <img src="${qrDataUrl}" alt="QR Code" style="width: 72px; height: 72px; display: block; border: 1px solid #cbd5e1; border-radius: 4px;" />
-            <div style="font-size: 8pt; font-weight: 700; color: #334155; margin-top: 2px;">SCAN TO VIEW</div>
-          </div>
-        ` : ''}
       </div>
+
+      <!-- Anuncio PDF Unified View (All In One) -->
+      ${anuncioSectionHtml}
 
       <!-- Month Navigation Controls Bar (Arrows Only) -->
       <div class="month-bar no-print">
-        <button onclick="goToPrevMonth()" class="month-nav-arrow" id="prevMonthBtn" title="Previous Month" aria-label="Previous Month">&#8592;</button>
+        <button type="button" onclick="goToPrevMonth(); return false;" ontouchend="goToPrevMonth(); return false;" class="month-nav-arrow" id="prevMonthBtn" title="Previous Month" aria-label="Previous Month">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="pointer-events: none;"><polyline points="15 18 9 12 15 6"></polyline></svg>
+        </button>
 
         <div class="month-title" id="monthDisplay">
           <span id="currentMonthText">${escapeHtml(getMonthName(initialMonth))}</span>
         </div>
 
-        <button onclick="goToNextMonth()" class="month-nav-arrow" id="nextMonthBtn" title="Next Month" aria-label="Next Month">&#8594;</button>
+        <button type="button" onclick="goToNextMonth(); return false;" ontouchend="goToNextMonth(); return false;" class="month-nav-arrow" id="nextMonthBtn" title="Next Month" aria-label="Next Month">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="pointer-events: none;"><polyline points="9 18 15 12 9 6"></polyline></svg>
+        </button>
       </div>
+
+      <!-- Quick 12-Month Selector Bar -->
+      ${monthPillsHtml}
 
       <!-- Small Month Calendar Overview Box -->
       <div class="mini-cal-card" id="miniCalContainer">
@@ -3602,6 +4717,48 @@ async function startServer() {
     const categoriesMapObj = ${categoriesListJson}.reduce((acc, c) => { acc[c.id] = c; return acc; }, {});
 
     let selectedCategoryFilter = 'all';
+
+    function switchUnifiedView(mode) {
+      const tabs = {
+        'all-in-one': document.getElementById('tabAllInOne'),
+        'events-only': document.getElementById('tabEventsOnly'),
+        'pdf-only': document.getElementById('tabPdfOnly')
+      };
+      Object.keys(tabs).forEach(function(k) {
+        if (tabs[k]) tabs[k].classList.remove('active');
+      });
+      if (tabs[mode]) tabs[mode].classList.add('active');
+
+      const anuncioCard = document.getElementById('anuncioUnifiedCard');
+      const monthBar = document.querySelector('.month-bar');
+      const pillsBar = document.getElementById('quickMonthsBarContainer');
+      const miniCal = document.getElementById('miniCalContainer');
+      const eventsList = document.getElementById('eventsListContainer');
+      const notesSec = document.getElementById('notesSection');
+
+      if (mode === 'all-in-one') {
+        if (anuncioCard) anuncioCard.style.display = 'block';
+        if (monthBar) monthBar.style.display = 'flex';
+        if (pillsBar) pillsBar.style.display = 'flex';
+        if (miniCal) miniCal.style.display = 'block';
+        if (eventsList) eventsList.style.display = 'block';
+        if (notesSec) notesSec.style.display = 'block';
+      } else if (mode === 'events-only') {
+        if (anuncioCard) anuncioCard.style.display = 'none';
+        if (monthBar) monthBar.style.display = 'flex';
+        if (pillsBar) pillsBar.style.display = 'flex';
+        if (miniCal) miniCal.style.display = 'block';
+        if (eventsList) eventsList.style.display = 'block';
+        if (notesSec) notesSec.style.display = 'block';
+      } else if (mode === 'pdf-only') {
+        if (anuncioCard) anuncioCard.style.display = 'block';
+        if (monthBar) monthBar.style.display = 'none';
+        if (pillsBar) pillsBar.style.display = 'none';
+        if (miniCal) miniCal.style.display = 'none';
+        if (eventsList) eventsList.style.display = 'none';
+        if (notesSec) notesSec.style.display = 'none';
+      }
+    }
 
     // Determine initial month: from URL ?month=YYYY-MM, or first event month, or current month
     const urlParams = new URLSearchParams(window.location.search);
@@ -3648,6 +4805,230 @@ async function startServer() {
     let selectedDayFilter = null;
     let searchQuery = '';
 
+    function computeNextMonth(ymStr) {
+      if (!ymStr || typeof ymStr !== 'string' || !ymStr.includes('-')) {
+        const now = new Date();
+        ymStr = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
+      }
+      const parts = ymStr.split('-');
+      let y = parseInt(parts[0], 10) || new Date().getFullYear();
+      let m = parseInt(parts[1], 10) || (new Date().getMonth() + 1);
+      m += 1;
+      if (m > 12) {
+        m = 1;
+        y += 1;
+      }
+      return y + '-' + String(m).padStart(2, '0');
+    }
+
+    function computePrevMonth(ymStr) {
+      if (!ymStr || typeof ymStr !== 'string' || !ymStr.includes('-')) {
+        const now = new Date();
+        ymStr = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0');
+      }
+      const parts = ymStr.split('-');
+      let y = parseInt(parts[0], 10) || new Date().getFullYear();
+      let m = parseInt(parts[1], 10) || (new Date().getMonth() + 1);
+      m -= 1;
+      if (m < 1) {
+        m = 12;
+        y -= 1;
+      }
+      return y + '-' + String(m).padStart(2, '0');
+    }
+
+    let lastNavTimestamp = 0;
+
+    function setMonth(ym) {
+      if (!ym) return;
+      activeMonth = ym;
+      selectedDayFilter = null;
+      updateUrl();
+      renderView();
+      if (typeof window !== 'undefined' && window.scrollTo) {
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+    }
+
+    function goToNextMonth() {
+      const now = Date.now();
+      if (now - lastNavTimestamp < 220) return;
+      lastNavTimestamp = now;
+      activeMonth = computeNextMonth(activeMonth);
+      selectedDayFilter = null;
+      updateUrl();
+      renderView();
+      if (typeof window !== 'undefined' && window.scrollTo) {
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+    }
+
+    function goToPrevMonth() {
+      const now = Date.now();
+      if (now - lastNavTimestamp < 220) return;
+      lastNavTimestamp = now;
+      activeMonth = computePrevMonth(activeMonth);
+      selectedDayFilter = null;
+      updateUrl();
+      renderView();
+      if (typeof window !== 'undefined' && window.scrollTo) {
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+    }
+
+    window.goToNextMonth = goToNextMonth;
+    window.goToPrevMonth = goToPrevMonth;
+    window.setMonth = setMonth;
+
+    function getGoogleCalLink(evt) {
+      const title = encodeURIComponent(evt.title || 'Church Event');
+      const doubleNl = String.fromCharCode(10) + String.fromCharCode(10);
+      const descParts = [];
+      if (evt.description) descParts.push(evt.description);
+      if (evt.notes) descParts.push('Notes: ' + evt.notes);
+      const desc = encodeURIComponent(descParts.join(doubleNl));
+      const loc = encodeURIComponent(evt.location || '');
+      const sDate = (evt.startDate || '').replace(/-/g, '');
+      const sTime = evt.isAllDay ? '' : ((evt.startTime || '09:00').replace(/:/g, '').slice(0, 4) + '00');
+      let dates = '';
+      if (evt.isAllDay) {
+        const p = (evt.startDate || '').split('-').map(Number);
+        const nextD = new Date(p[0], p[1] - 1, p[2] + 1);
+        const eDate = nextD.getFullYear() + String(nextD.getMonth() + 1).padStart(2, '0') + String(nextD.getDate()).padStart(2, '0');
+        dates = sDate + '/' + eDate;
+      } else {
+        const eDate = (evt.endDate || evt.startDate || '').replace(/-/g, '');
+        const eTime = evt.endTime
+          ? evt.endTime.replace(/:/g, '').slice(0, 4) + '00'
+          : (parseInt(sTime.slice(0, 2), 10) + 1).toString().padStart(2, '0') + sTime.slice(2);
+        dates = sDate + 'T' + sTime + '/' + eDate + 'T' + eTime;
+      }
+      return 'https://calendar.google.com/calendar/render?action=TEMPLATE&text=' + title + '&dates=' + dates + '&details=' + desc + '&location=' + loc;
+    }
+
+    function escapeIcsText(str) {
+      if (!str) return '';
+      const bs = String.fromCharCode(92);
+      const nl = String.fromCharCode(10);
+      const cr = String.fromCharCode(13);
+      return String(str)
+        .split(bs).join(bs + bs)
+        .split(';').join(bs + ';')
+        .split(',').join(bs + ',')
+        .split(cr).join('')
+        .split(nl).join(bs + 'n');
+    }
+
+    function generateIcs(evts, calName) {
+      const CRLF = String.fromCharCode(13, 10);
+      const dtstamp = new Date().toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+      let ics = "BEGIN:VCALENDAR" + CRLF + "VERSION:2.0" + CRLF + "PRODID:-//Church Ministry Schedule//ExecutiveSync//EN" + CRLF + "CALSCALE:GREGORIAN" + CRLF + "METHOD:PUBLISH" + CRLF + "X-WR-CALNAME:" + escapeIcsText(calName || 'Schedule') + CRLF;
+      evts.forEach(e => {
+        if (!e.startDate) return;
+        const sDate = e.startDate.replace(/[-/]/g, '').trim();
+        if (sDate.length < 8) return;
+        const uid = (e.id || Math.random().toString(36).substring(2)) + "@calendar";
+        ics += "BEGIN:VEVENT" + CRLF + "UID:" + uid + CRLF + "DTSTAMP:" + dtstamp + CRLF;
+        ics += "SUMMARY:" + escapeIcsText(e.title || 'Event') + CRLF;
+        if (e.isAllDay) {
+          const parts = e.startDate.split(/[-/]/).map(Number);
+          const d = new Date(parts[0], parts[1] - 1, parts[2] + 1);
+          const nextD = d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+          ics += "DTSTART;VALUE=DATE:" + sDate + CRLF;
+          ics += "DTEND;VALUE=DATE:" + nextD + CRLF;
+        } else {
+          const sTime = (e.startTime || '09:00').replace(/:/g, '').slice(0, 4) + '00';
+          const eTime = e.endTime
+            ? e.endTime.replace(/:/g, '').slice(0, 4) + '00'
+            : (parseInt(sTime.slice(0, 2), 10) + 1).toString().padStart(2, '0') + sTime.slice(2);
+          const eDate = (e.endDate || e.startDate || '').replace(/[-/]/g, '').trim();
+          ics += "DTSTART:" + sDate + "T" + sTime + CRLF;
+          ics += "DTEND:" + eDate + "T" + eTime + CRLF;
+        }
+        const doubleNl = String.fromCharCode(10) + String.fromCharCode(10);
+        const descParts = [];
+        if (e.description) descParts.push(e.description);
+        if (e.notes) descParts.push('Notes: ' + e.notes);
+        if (descParts.length > 0) {
+          ics += "DESCRIPTION:" + escapeIcsText(descParts.join(doubleNl)) + CRLF;
+        }
+        if (e.location) {
+          ics += "LOCATION:" + escapeIcsText(e.location) + CRLF;
+        }
+        ics += "STATUS:CONFIRMED" + CRLF + "TRANSP:OPAQUE" + CRLF + "END:VEVENT" + CRLF;
+      });
+      ics += "END:VCALENDAR" + CRLF;
+      return ics;
+    }
+
+    function triggerIcsFileDownload(icsContent, filename) {
+      const blob = new Blob([icsContent], { type: 'text/calendar;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }, 300);
+    }
+
+    function downloadAllEventsIcs(monthOnly) {
+      const targetEvts = monthOnly
+        ? allEvents.filter(e => (e.startDate || '').startsWith(activeMonth))
+        : allEvents;
+      if (targetEvts.length === 0) {
+        alert('No events found to add.');
+        return;
+      }
+      const title = "${isAll ? 'Sacramentos' : escapeHtml(category.name)}" + (monthOnly ? " - " + getMonthName(activeMonth) : " Schedule");
+      const filename = "${isAll ? 'sacramentos' : escapeHtml(category.name.toLowerCase().replace(/[^a-z0-9]/g, '_'))}" + (monthOnly ? "_" + activeMonth : "") + ".ics";
+      const ics = generateIcs(targetEvts, title);
+      triggerIcsFileDownload(ics, filename);
+      closeCalendarExportModal();
+    }
+
+    function addSingleEventToIcs(eventId) {
+      const evt = allEvents.find(e => String(e.id) === String(eventId));
+      if (!evt) return;
+      const title = (evt.title || 'Event');
+      const filename = title.toLowerCase().replace(/[^a-z0-9]/g, '_') + '.ics';
+      const ics = generateIcs([evt], title);
+      triggerIcsFileDownload(ics, filename);
+    }
+
+    function openUpcomingInGoogle() {
+      const nowStr = new Date().toISOString().slice(0, 10);
+      const upcoming = allEvents
+        .filter(e => (e.startDate || '') >= nowStr)
+        .sort((a, b) => (a.startDate || '').localeCompare(b.startDate || ''));
+      const targetEvt = upcoming[0] || allEvents[0];
+      if (!targetEvt) {
+        alert('No events scheduled.');
+        return;
+      }
+      window.open(getGoogleCalLink(targetEvt), '_blank');
+      closeCalendarExportModal();
+    }
+
+    function openCalendarExportModal() {
+      const m = document.getElementById('calendarModal');
+      if (m) m.classList.add('open');
+    }
+
+    function closeCalendarExportModal(e) {
+      if (!e || e.target === document.getElementById('calendarModal') || !e.target.closest || !e.target.closest('.cal-modal-box')) {
+        const m = document.getElementById('calendarModal');
+        if (m) m.classList.remove('open');
+      }
+    }
+
+    function downloadCalendarIcs() {
+      openCalendarExportModal();
+    }
+
     function formatTime(timeStr) {
       if (!timeStr) return '';
       const parts = timeStr.split(':');
@@ -3679,28 +5060,12 @@ async function startServer() {
       return ymStr;
     }
 
-    function computeNextMonth(ymStr) {
-      const parts = ymStr.split('-');
-      let y = parseInt(parts[0], 10);
-      let m = parseInt(parts[1], 10);
-      m += 1;
-      if (m > 12) {
-        m = 1;
-        y += 1;
-      }
-      return y + '-' + String(m).padStart(2, '0');
-    }
-
-    function computePrevMonth(ymStr) {
-      const parts = ymStr.split('-');
-      let y = parseInt(parts[0], 10);
-      let m = parseInt(parts[1], 10);
-      m -= 1;
-      if (m < 1) {
-        m = 12;
-        y -= 1;
-      }
-      return y + '-' + String(m).padStart(2, '0');
+    function updateUrl() {
+      try {
+        const url = new URL(window.location.href);
+        url.searchParams.set('month', activeMonth);
+        window.history.pushState({}, '', url.toString());
+      } catch (e) {}
     }
 
     function renderMiniCalendar() {
@@ -3735,7 +5100,7 @@ async function startServer() {
         '</div>';
 
       if (selectedDayFilter) {
-        html += '<button onclick="clearDayFilter()" class="no-print" style="border:1px solid #cbd5e1; background:#ffffff; font-size:11px; font-weight:700; color:#4f46e5; border-radius:6px; padding:3px 8px; cursor:pointer;">' +
+        html += '<button type="button" onclick="clearDayFilter()" class="no-print" style="border:1px solid #cbd5e1; background:#ffffff; font-size:11px; font-weight:700; color:#4f46e5; border-radius:6px; padding:3px 8px; cursor:pointer;">' +
           '✕ Clear Day Filter (' + selectedDayFilter + ')' +
           '</button>';
       }
@@ -3771,9 +5136,9 @@ async function startServer() {
         if (isToday) cellClasses += ' today-cell';
         if (isSelected) cellClasses += ' active-day';
 
-        const clickHandler = count > 0 ? 'onclick="toggleDayFilter(\\'' + dStr + '\\')"' : '';
+        const clickHandler = count > 0 ? 'onclick="toggleDayFilter(this.dataset.date)"' : '';
 
-        html += '<div class="' + cellClasses + '" ' + clickHandler + ' title="' + (count > 0 ? count + ' event(s) on ' + dStr : dStr) + '">';
+        html += '<div class="' + cellClasses + '" data-date="' + dStr + '" ' + clickHandler + ' title="' + (count > 0 ? count + ' event(s) on ' + dStr : dStr) + '">';
         html += '<span>' + d + '</span>';
         if (count > 0) {
           const dotBg = isSelected ? '#ffffff' : categoryHex;
@@ -3793,6 +5158,14 @@ async function startServer() {
         selectedDayFilter = dateStr;
       }
       renderView();
+      if (selectedDayFilter) {
+        setTimeout(() => {
+          const banner = document.getElementById('activeDateFilterBanner') || document.getElementById('eventsListContainer');
+          if (banner) {
+            banner.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          }
+        }, 60);
+      }
     }
 
     function clearDayFilter() {
@@ -3800,17 +5173,19 @@ async function startServer() {
       renderView();
     }
 
+    window.toggleDayFilter = toggleDayFilter;
+    window.clearDayFilter = clearDayFilter;
+
     function renderView() {
       const monthTitle = getMonthName(activeMonth);
       const monthTextEl = document.getElementById('currentMonthText');
       if (monthTextEl) monthTextEl.innerText = monthTitle;
-      document.title = "${escapeHtml(category.name)} Schedule - " + monthTitle;
+      document.title = "${isAll ? 'Sacramentos' : escapeHtml(category.name + ' Schedule')} - " + monthTitle;
 
       const nextMonthStr = computeNextMonth(activeMonth);
       const nextMonthName = getMonthName(nextMonthStr);
       const nextBtn = document.getElementById('nextMonthBtn');
       if (nextBtn) {
-        nextBtn.innerHTML = '&#8594;';
         nextBtn.title = 'Go to ' + nextMonthName;
       }
 
@@ -3818,9 +5193,11 @@ async function startServer() {
       const prevMonthName = getMonthName(prevMonthStr);
       const prevBtn = document.getElementById('prevMonthBtn');
       if (prevBtn) {
-        prevBtn.innerHTML = '&#8592;';
         prevBtn.title = 'Go to ' + prevMonthName;
       }
+
+      // Re-render quick month selector bar pills
+      renderQuickMonthPills();
 
       // Render the mini-calendar overview
       renderMiniCalendar();
@@ -3846,7 +5223,7 @@ async function startServer() {
           monthButtonsHtml = '<div style="margin-top: 18px; padding-top: 14px; border-top: 1px dashed #e2e8f0;">' +
             '<div style="font-size: 12px; font-weight: 700; color: #64748b; margin-bottom: 10px;">📅 Scheduled Events Available In Other Months:</div>' +
             '<div style="display: flex; flex-wrap: wrap; gap: 8px; justify-content: center;">' +
-            availableMonths.map(m => '<button onclick="setMonth(\\'' + m + '\\')" style="padding: 6px 14px; font-size: 12px; font-weight: 700; border-radius: 9999px; background: #e0e7ff; color: #4338ca; border: 1px solid #c7d2fe; cursor: pointer;">' + getMonthName(m) + '</button>').join('') +
+            availableMonths.map(m => '<button type="button" class="quick-month-btn" data-ym="' + m + '" onclick="setMonth(this.dataset.ym)" style="padding: 6px 14px; font-size: 12px; font-weight: 700; border-radius: 9999px; background: #e0e7ff; color: #4338ca; border: 1px solid #c7d2fe; cursor: pointer;">' + getMonthName(m) + '</button>').join('') +
             '</div></div>';
         }
 
@@ -3855,7 +5232,7 @@ async function startServer() {
           '<h3 style="font-size: 14px; font-weight: 800; color: #1e293b; margin: 0 0 4px 0;">No Events in ' + monthTitle + '</h3>' +
           '<p style="font-size: 13px; color: #64748b; margin: 0;">' + emptyMsg + '</p>' +
           (selectedDayFilter ? 
-            '<div style="margin-top: 14px;"><button onclick="clearDayFilter()" style="border:1px solid #cbd5e1; background:#ffffff; font-size:12px; font-weight:700; color:#4f46e5; border-radius:8px; padding:6px 12px; cursor:pointer;"><span>Show All ' + monthTitle + ' Events</span></button></div>' : ''
+            '<div style="margin-top: 14px;"><button type="button" onclick="clearDayFilter()" style="border:1px solid #cbd5e1; background:#ffffff; font-size:12px; font-weight:700; color:#4f46e5; border-radius:8px; padding:6px 12px; cursor:pointer;"><span>Show All ' + monthTitle + ' Events</span></button></div>' : ''
           ) +
           monthButtonsHtml +
           '</div>';
@@ -3869,6 +5246,14 @@ async function startServer() {
         });
 
         let html = '';
+        if (selectedDayFilter) {
+          html += '<div id="activeDateFilterBanner" class="no-print" style="display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 12px; margin-bottom:12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:10px;">' +
+            '<div style="display:flex; align-items:center; gap:6px; font-size:12px; font-weight:700; color:#1e40af;">' +
+              '<span>🎯 Filtered by: <strong>' + formatDate(selectedDayFilter) + '</strong> (' + monthEvents.length + ' event' + (monthEvents.length === 1 ? '' : 's') + ')</span>' +
+            '</div>' +
+            '<button type="button" onclick="clearDayFilter()" style="border:1px solid #93c5fd; background:#ffffff; color:#1d4ed8; font-size:11px; font-weight:700; border-radius:6px; padding:4px 10px; cursor:pointer; white-space:nowrap;">✕ Show All Month</button>' +
+          '</div>';
+        }
         Object.keys(grouped).forEach(dateKey => {
           const dateFormatted = formatDate(dateKey);
           const count = grouped[dateKey].length;
@@ -3889,15 +5274,31 @@ async function startServer() {
             if (evt.notes && evt.notes.trim()) {
               noteSnippet = '<div style="font-size: 12px; color: #64748b; margin-top: 4px; line-height: 1.4;">📝 ' + escapeText(evt.notes) + '</div>';
             }
+            let locSnippet = '';
+            if (evt.location && evt.location.trim()) {
+              locSnippet = '<div class="event-location">📍 <span>' + escapeText(evt.location) + '</span></div>';
+            }
+            let descSnippet = '';
+            if (evt.description && evt.description.trim() && evt.description.trim() !== (evt.notes || '').trim()) {
+              descSnippet = '<div style="font-size: 12px; color: #64748b; margin-top: 3px; font-style: italic;">' + escapeText(evt.description) + '</div>';
+            }
 
             html += '<div class="event-row" style="border-left: 4px solid ' + evtColor + ';">' +
               '<div style="flex:1;">' +
                 '<h3 class="event-title">' + escapeText(evt.title) + '</h3>' +
+                locSnippet +
+                descSnippet +
                 noteSnippet +
               '</div>' +
               '<div class="event-datetime">' +
-                '<span class="event-date">' + dateFormatted + '</span>' +
-                '<span class="event-time">⏰ ' + timeDisplay + '</span>' +
+                '<div style="display:flex; align-items:center; gap:8px; justify-content:flex-end;">' +
+                  '<span class="event-date">' + dateFormatted + '</span>' +
+                  '<span class="event-time">⏰ ' + timeDisplay + '</span>' +
+                '</div>' +
+                '<div class="event-cal-actions no-print">' +
+                  '<button type="button" class="event-cal-btn" data-event-id="' + (evt.id || '') + '" onclick="addSingleEventToIcs(this.dataset.eventId); return false;" title="Add to iPhone or Android Calendar (.ics)">📱 Add to Phone</button>' +
+                  '<a href="' + getGoogleCalLink(evt) + '" target="_blank" rel="noopener noreferrer" class="event-cal-btn google" title="Add to Google Calendar">📅 Google Calendar</a>' +
+                '</div>' +
               '</div>' +
             '</div>';
           });
@@ -3907,6 +5308,15 @@ async function startServer() {
 
         container.innerHTML = html;
       }
+
+      // Sync active month button
+      document.querySelectorAll('.quick-month-btn').forEach(btn => {
+        if (btn.getAttribute('data-ym') === activeMonth) {
+          btn.classList.add('active');
+        } else {
+          btn.classList.remove('active');
+        }
+      });
 
       // Render Notes Section at bottom of page
       const notesContainer = document.getElementById('notesContainer');
@@ -3922,11 +5332,16 @@ async function startServer() {
             if (!e.isAllDay && e.startTime) {
               timeStr = ' • ' + formatTime(e.startTime);
             }
+            let noteLoc = '';
+            if (e.location && e.location.trim()) {
+              noteLoc = '<div class="event-location" style="margin-top:2px;">📍 <span>' + escapeText(e.location) + '</span></div>';
+            }
             notesHtml += '<div class="note-card">' +
               '<div class="note-card-header">' +
                 '<span class="note-event-title">' + escapeText(e.title) + '</span>' +
                 '<span class="note-event-date">' + dateFormatted + timeStr + '</span>' +
               '</div>' +
+              noteLoc +
               '<div class="note-card-body">' + escapeText(e.notes) + '</div>' +
             '</div>';
           });
@@ -3942,32 +5357,115 @@ async function startServer() {
       return div.innerHTML;
     }
 
-    function goToNextMonth() {
-      activeMonth = computeNextMonth(activeMonth);
-      selectedDayFilter = null;
-      updateUrl();
-      renderView();
-      window.scrollTo({ top: 0, behavior: 'smooth' });
+    function renderQuickMonthPills() {
+      const activeYear = parseInt(activeMonth.split('-')[0], 10) || new Date().getFullYear();
+      const pillsContainer = document.getElementById('quickMonthsBarContainer');
+      if (!pillsContainer) return;
+      let pillsHtml = '';
+      for (let m = 1; m <= 12; m++) {
+        const ym = activeYear + '-' + String(m).padStart(2, '0');
+        const mName = new Date(activeYear, m - 1, 1).toLocaleDateString('en-US', { month: 'short' });
+        const evtCount = allEvents.filter(e => (e.startDate || '').startsWith(ym)).length;
+        const isAct = ym === activeMonth;
+        pillsHtml += '<button type="button" class="quick-month-btn' + (isAct ? ' active' : '') + '" data-ym="' + ym + '" onclick="setMonth(this.dataset.ym)"><span>' + mName + '</span>' + (evtCount > 0 ? '<span class="pill-badge">' + evtCount + '</span>' : '') + '</button>';
+      }
+      pillsContainer.innerHTML = pillsHtml;
     }
 
-    function goToPrevMonth() {
-      activeMonth = computePrevMonth(activeMonth);
-      selectedDayFilter = null;
-      updateUrl();
-      renderView();
-      window.scrollTo({ top: 0, behavior: 'smooth' });
+    // High-reliability direct and delegated event listeners for navigation and interaction
+    function setupNavControls() {
+      const prev = document.getElementById('prevMonthBtn');
+      if (prev) {
+        prev.onclick = function(e) {
+          if (e) {
+            e.preventDefault();
+            e.stopPropagation();
+          }
+          goToPrevMonth();
+          return false;
+        };
+        prev.ontouchend = function(e) {
+          if (e) {
+            e.preventDefault();
+            e.stopPropagation();
+          }
+          goToPrevMonth();
+          return false;
+        };
+      }
+      const next = document.getElementById('nextMonthBtn');
+      if (next) {
+        next.onclick = function(e) {
+          if (e) {
+            e.preventDefault();
+            e.stopPropagation();
+          }
+          goToNextMonth();
+          return false;
+        };
+        next.ontouchend = function(e) {
+          if (e) {
+            e.preventDefault();
+            e.stopPropagation();
+          }
+          goToNextMonth();
+          return false;
+        };
+      }
     }
+    setupNavControls();
 
-    function updateUrl() {
-      try {
-        const url = new URL(window.location.href);
-        url.searchParams.set('month', activeMonth);
-        window.history.pushState({}, '', url.toString());
-      } catch (e) {}
-    }
+    document.addEventListener('click', function(e) {
+      if (!e.target || e.defaultPrevented) return;
+      const prev = e.target.closest('#prevMonthBtn');
+      if (prev) {
+        e.preventDefault();
+        goToPrevMonth();
+        return;
+      }
+      const next = e.target.closest('#nextMonthBtn');
+      if (next) {
+        e.preventDefault();
+        goToNextMonth();
+        return;
+      }
+      const monthBtn = e.target.closest('.quick-month-btn');
+      if (monthBtn) {
+        e.preventDefault();
+        const ym = monthBtn.getAttribute('data-ym');
+        if (ym) setMonth(ym);
+        return;
+      }
+      const dayCell = e.target.closest('.mini-cal-cell');
+      if (dayCell) {
+        const dateStr = dayCell.getAttribute('data-date');
+        if (dateStr) {
+          e.preventDefault();
+          toggleDayFilter(dateStr);
+          return;
+        }
+      }
+      const calBtn = e.target.closest('.event-cal-btn[data-event-id]');
+      if (calBtn) {
+        e.preventDefault();
+        const eventId = calBtn.getAttribute('data-event-id');
+        if (eventId) addSingleEventToIcs(eventId);
+        return;
+      }
+    });
 
     // Initial render
     renderView();
+
+    // Auto-switch view if requested (?view=anuncios or ?view=pdf-only or ?view=events-only)
+    const initialViewParam = urlParams.get('view') || urlParams.get('tab') || urlParams.get('mode');
+    if (initialViewParam === 'anuncios' || initialViewParam === 'anuncio') {
+      switchUnifiedView('all-in-one');
+    } else if (initialViewParam === 'pdf' || initialViewParam === 'pdf-only') {
+      switchUnifiedView('pdf-only');
+    } else if (initialViewParam === 'events' || initialViewParam === 'events-only') {
+      switchUnifiedView('events-only');
+    }
 
     // Auto-trigger print or save-as-pdf if requested (?print=1 or ?autoprint=1)
     if (urlParams.get('print') === '1' || urlParams.get('autoprint') === '1') {
@@ -3977,7 +5475,7 @@ async function startServer() {
     }
 
     let isFetchingLive = false;
-    let lastEventsHash = JSON.stringify(allEvents.map(e => (e.id || '') + (e.startDate || '') + (e.startTime || '') + (e.title || '') + (e.notes || '')));
+    let lastEventsHash = JSON.stringify(allEvents.map(e => (e.id || '') + (e.startDate || '') + (e.startTime || '') + (e.title || '') + (e.location || '') + (e.notes || '')));
 
     async function fetchLatestLiveEvents(manual) {
       if (isFetchingLive) return;
@@ -4004,7 +5502,7 @@ async function startServer() {
             ? freshEvents
             : matching;
 
-          const newHash = JSON.stringify(effectiveMatching.map(e => (e.id || '') + (e.startDate || '') + (e.startTime || '') + (e.title || '') + (e.notes || '')));
+          const newHash = JSON.stringify(effectiveMatching.map(e => (e.id || '') + (e.startDate || '') + (e.startTime || '') + (e.title || '') + (e.location || '') + (e.notes || '')));
 
           if (newHash !== lastEventsHash || manual) {
             lastEventsHash = newHash;
@@ -4021,6 +5519,7 @@ async function startServer() {
                 categoryId: e.categoryId || '',
                 categoryName: cat.name || '',
                 categoryHex: cat.hex || categoryHex,
+                location: e.location || '',
                 notes: e.notes || e.description || '',
                 description: e.description || ''
               };
@@ -4074,21 +5573,21 @@ async function startServer() {
    */
   function ensureCameraScannableColor(hexColor?: string): string {
     if (!hexColor || hexColor === '#000000' || hexColor === '#0f172a') {
-      return '#0f172a';
+      return '#000000';
     }
     let clean = hexColor.replace('#', '').trim();
     if (clean.length === 3) {
       clean = clean.split('').map((c) => c + c).join('');
     }
-    if (clean.length !== 6) return '#0f172a';
+    if (clean.length !== 6) return '#000000';
 
     const r = parseInt(clean.substring(0, 2), 16) / 255;
     const g = parseInt(clean.substring(2, 4), 16) / 255;
     const b = parseInt(clean.substring(4, 6), 16) / 255;
     const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
 
-    if (luminance > 0.25) {
-      const factor = 0.35;
+    if (luminance > 0.15) {
+      const factor = 0.18;
       const dr = Math.round(r * 255 * factor).toString(16).padStart(2, '0');
       const dg = Math.round(g * 255 * factor).toString(16).padStart(2, '0');
       const db = Math.round(b * 255 * factor).toString(16).padStart(2, '0');
@@ -4102,14 +5601,15 @@ async function startServer() {
   app.get(["/pdf/:categoryId", "/public/pdf/:categoryId", "/pdf", "/public/pdf"], async (req, res) => {
     const rawId = req.params.categoryId || (req.query.category as string) || (req.query.cat as string) || 'all';
     const cleanId = (rawId || '').trim();
-    const isAll = cleanId.toLowerCase() === 'all' || cleanId.toLowerCase() === 'overview';
+    const isAnuncios = cleanId.toLowerCase() === 'anuncios' || cleanId.toLowerCase() === 'anuncio' || (req.query.view as string) === 'anuncios';
+    const isAll = cleanId.toLowerCase() === 'all' || cleanId.toLowerCase() === 'overview' || cleanId.toLowerCase() === 'sacramentos' || isAnuncios;
     const categories = db.categories || SEED_CATEGORIES;
     const category = isAll
       ? {
-          id: 'all',
-          name: 'All Categories Overview',
-          hex: '#4f46e5',
-          description: 'Master calendar schedule combining all categories and ministries'
+          id: isAnuncios ? 'anuncios' : 'all',
+          name: isAnuncios ? 'Anuncios Parroquiales & Sacramentos' : 'Sacramentos',
+          hex: isAnuncios ? '#f59e0b' : '#4f46e5',
+          description: 'Calendario Maestro y Anuncios Parroquiales'
         }
       : categories.find(
           (c) => c.id.toLowerCase() === cleanId.toLowerCase() || c.name.toLowerCase() === cleanId.toLowerCase()
@@ -4123,26 +5623,35 @@ async function startServer() {
     let baseOrigin = ((db.settings as any)?.publicBaseUrl || '').trim().replace(/\/+$/, '');
     if (!baseOrigin) {
       let host = req.get("x-forwarded-host") || req.get("host") || "localhost:3000";
-      // CRITICAL: Replace 'ais-dev-' with 'ais-pre-' so scanning the QR code from ANY external phone/device
-      // directs the browser to the public shared environment without requiring AI Studio developer login!
-      if (host.includes('ais-dev-')) {
-        host = host.replace('ais-dev-', 'ais-pre-');
-      }
       const protocol = req.protocol === 'https' || req.get('x-forwarded-proto') === 'https' ? 'https' : 'http';
       baseOrigin = `${protocol}://${host}`;
     }
-    const targetUrl = isAll
+    if (baseOrigin.includes('ais-dev-')) {
+      baseOrigin = baseOrigin.replace('ais-dev-', 'ais-pre-');
+    }
+    if (!baseOrigin || baseOrigin.includes('localhost') || baseOrigin.includes('127.0.0.1')) {
+      baseOrigin = 'https://ais-pre-7l4infuif524ncheylrol3-488950738317.us-east1.run.app';
+    }
+
+    // Check if an independent public PDF link is set for this category or globally (filter out legacy dpaste)
+    const independentPdfUrls = (db.settings as any)?.independentPdfUrls || {};
+    let independentTargetUrl = independentPdfUrls[category.id] || (isAll ? independentPdfUrls['all'] : undefined) || independentPdfUrls['all'];
+    if (independentTargetUrl && (independentTargetUrl.includes('dpaste') || !independentTargetUrl.startsWith('http'))) {
+      independentTargetUrl = undefined;
+    }
+
+    const targetUrl = independentTargetUrl || (isAll
       ? `${baseOrigin}/pdf/all`
-      : `${baseOrigin}/pdf/${encodeURIComponent(category.id)}`;
+      : `${baseOrigin}/pdf/${encodeURIComponent(category.id)}`);
 
     let qrDataUrl = '';
     try {
       qrDataUrl = await QRCode.toDataURL(targetUrl, {
-        width: 480,
-        margin: 3, // Standard quiet zone for phone cameras
+        width: 512,
+        margin: 4, // ISO 18004 standard 4-module quiet zone for fast camera detection
         errorCorrectionLevel: 'M', // 15% error correction yields larger, clearer modules
         color: {
-          dark: ensureCameraScannableColor(category.hex),
+          dark: '#000000',
           light: '#ffffff'
         }
       });
@@ -4150,9 +5659,58 @@ async function startServer() {
       console.warn('Could not generate server-side QR data URL:', err);
     }
 
+    // Ensure database is fresh from disk and 24/7 Cloud Firestore
+    if (fs.existsSync(DB_FILE)) {
+      try {
+        const raw = fs.readFileSync(DB_FILE, 'utf-8');
+        if (raw.trim()) {
+          const diskDb = JSON.parse(raw);
+          if (Array.isArray(diskDb.events)) db.events = diskDb.events;
+          if (diskDb.settings) db.settings = diskDb.settings;
+          if (Array.isArray(diskDb.deletedEventIds)) db.deletedEventIds = diskDb.deletedEventIds;
+        }
+      } catch (e) {}
+    }
+    try {
+      await syncDbFromFirestore(db);
+    } catch (e) {}
+
     const deletedSet = new Set(db.deletedEventIds || []);
-    const cleanAllEvents = deduplicateServerEvents(db.events || [], deletedSet);
+    let cleanAllEvents = deduplicateServerEvents(db.events || [], deletedSet);
     db.events = cleanAllEvents;
+
+    // Support optional packed event payload from query parameter (?d=... or ?data=...)
+    const queryData = (req.query.d as string) || (req.query.data as string) || (req.query.payload as string);
+    if (queryData) {
+      try {
+        let b64 = decodeURIComponent(queryData).trim().replace(/-/g, '+').replace(/_/g, '/');
+        while (b64.length % 4) b64 += '=';
+        const decoded = Buffer.from(b64, 'base64').toString('utf-8');
+        const parsed = JSON.parse(decoded);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const queryEvents: CalendarEvent[] = parsed.map((item: any) => ({
+            id: item.i || `evt-q-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            title: item.t || 'Event',
+            startDate: item.sd || item.s || '',
+            endDate: item.ed || item.e || item.sd || item.s || '',
+            startTime: item.st || '',
+            endTime: item.et || '',
+            categoryId: item.c || cleanId,
+            location: item.l || '',
+            description: item.d || '',
+            notes: '',
+            isAllDay: Boolean(item.ad),
+            userId: 'qr_scanner',
+            createdBy: 'Organizers'
+          }));
+          cleanAllEvents = deduplicateServerEvents([...cleanAllEvents, ...queryEvents], deletedSet);
+          db.events = cleanAllEvents;
+          saveDb(db);
+        }
+      } catch (e) {
+        console.warn('Error unpacking query events in /pdf/:categoryId:', e);
+      }
+    }
 
     let matchingEvents = isAll
       ? cleanAllEvents
@@ -4185,10 +5743,10 @@ async function startServer() {
     try {
       const { categoryId } = req.params;
       const cleanId = (categoryId || '').trim();
-      const isAll = cleanId.toLowerCase() === 'all' || cleanId.toLowerCase() === 'overview';
+      const isAll = cleanId.toLowerCase() === 'all' || cleanId.toLowerCase() === 'overview' || cleanId.toLowerCase() === 'sacramentos';
       const categories = db.categories || SEED_CATEGORIES;
       const category = isAll
-        ? { id: 'all', name: 'All Categories Overview', hex: '#4f46e5' }
+        ? { id: 'all', name: 'Sacramentos', hex: '#4f46e5' }
         : categories.find(
             (c) => c.id.toLowerCase() === cleanId.toLowerCase() || c.name.toLowerCase() === cleanId.toLowerCase()
           ) || { id: cleanId, name: cleanId, hex: '#4f46e5' };
@@ -4196,24 +5754,29 @@ async function startServer() {
       let baseOrigin = ((db.settings as any)?.publicBaseUrl || '').trim().replace(/\/+$/, '');
       if (!baseOrigin) {
         let host = req.get("x-forwarded-host") || req.get("host") || "localhost:3000";
-        if (host.includes('ais-dev-')) {
-          host = host.replace('ais-dev-', 'ais-pre-');
-        }
         const protocol = req.protocol === 'https' || req.get('x-forwarded-proto') === 'https' ? 'https' : 'http';
         baseOrigin = `${protocol}://${host}`;
       }
-      const targetUrl = isAll
+
+      // Check if an independent public PDF link is configured (filter out legacy dpaste)
+      const independentPdfUrls = (db.settings as any)?.independentPdfUrls || {};
+      let independentTargetUrl = independentPdfUrls[category.id] || (isAll ? independentPdfUrls['all'] : undefined) || independentPdfUrls['all'];
+      if (independentTargetUrl && (independentTargetUrl.includes('dpaste') || !independentTargetUrl.startsWith('http'))) {
+        independentTargetUrl = undefined;
+      }
+
+      const targetUrl = independentTargetUrl || (isAll
         ? `${baseOrigin}/pdf/all`
-        : `${baseOrigin}/pdf/${encodeURIComponent(category.id)}`;
+        : `${baseOrigin}/pdf/${encodeURIComponent(category.id)}`);
 
       // Generate ultra high-resolution 1024x1024 PNG buffer with camera-scannable color
       const pngBuffer = await QRCode.toBuffer(targetUrl, {
         type: 'png',
         width: 1024,
-        margin: 3,
+        margin: 4, // ISO standard quiet zone
         errorCorrectionLevel: 'M',
         color: {
-          dark: ensureCameraScannableColor(category.hex),
+          dark: '#000000',
           light: '#ffffff'
         }
       });
@@ -4287,9 +5850,9 @@ async function startServer() {
     const protocol = req.protocol === 'https' || req.get('x-forwarded-proto') === 'https' ? 'https' : 'http';
     const devOrigin = `${protocol}://${host}`;
     const isAiStudio = devOrigin.includes('ais-dev-') || devOrigin.includes('ais-pre-');
-    let sharedOrigin = devOrigin;
-    if (sharedOrigin.includes('ais-dev-')) {
-      sharedOrigin = sharedOrigin.replace('ais-dev-', 'ais-pre-');
+    let sharedOrigin = devOrigin.includes('ais-dev-') ? devOrigin.replace('ais-dev-', 'ais-pre-') : devOrigin;
+    if (!sharedOrigin || sharedOrigin.includes('localhost') || sharedOrigin.includes('127.0.0.1')) {
+      sharedOrigin = 'https://ais-pre-7l4infuif524ncheylrol3-488950738317.us-east1.run.app';
     }
     const customOrigin = ((db.settings as any)?.publicBaseUrl || '').trim().replace(/\/+$/, '');
     const isDeployed = !isAiStudio && (host.includes('run.app') || Boolean(customOrigin));
@@ -4297,11 +5860,172 @@ async function startServer() {
       devOrigin,
       sharedOrigin,
       customOrigin,
-      effectiveOrigin: customOrigin || (isDeployed ? devOrigin : sharedOrigin),
+      effectiveOrigin: customOrigin || sharedOrigin,
       isCustom: Boolean(customOrigin),
       isAiStudio,
       isDeployed
     });
+  });
+
+  // Endpoints for Managing Independent Public PDF URLs (Google Drive, Dropbox, Public Website, etc.)
+  app.get("/api/pdf-urls", (req, res) => {
+    const urls = (db.settings as any)?.independentPdfUrls || {};
+    res.json({ urls });
+  });
+
+  app.post("/api/pdf-urls", (req, res) => {
+    try {
+      const { categoryId, url } = req.body || {};
+      const catKey = (categoryId || 'all').toLowerCase();
+      if (!db.settings) db.settings = {} as any;
+      if (!(db.settings as any).independentPdfUrls) (db.settings as any).independentPdfUrls = {};
+
+      if (url && typeof url === 'string' && url.trim()) {
+        (db.settings as any).independentPdfUrls[catKey] = url.trim();
+      } else {
+        delete (db.settings as any).independentPdfUrls[catKey];
+      }
+      saveDb(db);
+      res.json({ success: true, urls: (db.settings as any).independentPdfUrls });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to save PDF URL' });
+    }
+  });
+
+  // Helper function to build standalone clean, responsive, mobile-ready HTML schedule
+  function buildStandaloneHtmlSchedule(data: {
+    categoryName: string;
+    hex: string;
+    events: any[];
+  }): string {
+    const { categoryName, hex, events } = data;
+    const sorted = [...(events || [])].sort((a, b) => {
+      const da = `${a.startDate || ''}T${a.startTime || '00:00'}`;
+      const db = `${b.startDate || ''}T${b.startTime || '00:00'}`;
+      return da.localeCompare(db);
+    });
+
+    const escapeHtml = (str: string) =>
+      (str || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+
+    const eventsHtml = sorted.length === 0
+      ? `<div style="text-align:center;padding:48px 24px;color:#64748b;font-size:15px;background:#ffffff;border-radius:16px;border:1px dashed #cbd5e1;">No upcoming events scheduled at this time.</div>`
+      : sorted.map((evt) => {
+          const dateStr = evt.startDate || 'TBD';
+          const timeStr = evt.isAllDay ? 'All Day' : (evt.startTime ? `${evt.startTime}${evt.endTime ? ' - ' + evt.endTime : ''}` : 'All Day');
+          return `
+          <div style="background:#ffffff;border:1px solid #e2e8f0;border-left:5px solid ${hex || '#4f46e5'};border-radius:12px;padding:16px 20px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,0.04);">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:6px;">
+              <h3 style="margin:0;font-size:17px;font-weight:700;color:#0f172a;line-height:1.3;">${escapeHtml(evt.title)}</h3>
+              <span style="font-size:12px;font-weight:600;color:#047857;background:#ecfdf5;border:1px solid #a7f3d0;padding:2px 8px;border-radius:9999px;">${escapeHtml(timeStr)}</span>
+            </div>
+            <div style="font-size:13px;font-weight:600;color:#475569;margin-bottom:6px;">📅 ${escapeHtml(dateStr)}${evt.location ? ` &nbsp;•&nbsp; 📍 ${escapeHtml(evt.location)}` : ''}</div>
+            ${evt.tema ? `<div style="font-size:12px;font-weight:600;color:#4338ca;background:#eef2ff;padding:3px 8px;border-radius:6px;display:inline-block;margin-bottom:6px;">Theme: ${escapeHtml(evt.tema)}</div>` : ''}
+            ${evt.description ? `<p style="margin:6px 0 0 0;font-size:13px;color:#334155;line-height:1.5;">${escapeHtml(evt.description)}</p>` : ''}
+          </div>
+          `;
+        }).join('');
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(categoryName)} Schedule</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #f8fafc; color: #0f172a; margin: 0; padding: 24px 16px; line-height: 1.5; }
+    .container { max-width: 680px; margin: 0 auto; }
+    .header { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 24px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); text-align: center; }
+    .badge { display: inline-block; padding: 4px 12px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; border-radius: 9999px; background: ${hex || '#4f46e5'}15; color: ${hex || '#4f46e5'}; margin-bottom: 8px; }
+    h1 { margin: 4px 0 8px 0; font-size: 24px; font-weight: 800; color: #0f172a; }
+    p.subtitle { margin: 0; font-size: 13px; color: #64748b; }
+    .actions { display: flex; gap: 10px; justify-content: center; margin-top: 14px; }
+    .btn { background: #0f172a; color: #ffffff; border: none; padding: 8px 16px; font-size: 13px; font-weight: 600; border-radius: 8px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+    .btn:hover { background: #1e293b; }
+    .footer { text-align: center; font-size: 11px; color: #94a3b8; margin-top: 30px; padding-top: 16px; border-top: 1px solid #e2e8f0; }
+    @media print { .btn, .footer { display: none !important; } body { background: #fff; padding: 0; } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <span class="badge">${escapeHtml(categoryName)}</span>
+      <h1>${escapeHtml(categoryName)} Schedule</h1>
+      <p class="subtitle">Public Schedule • Scanned via QR Code • Works 24/7 Without App Login</p>
+      <div class="actions">
+        <button class="btn" onclick="window.print()">🖨️ Print / Save PDF</button>
+      </div>
+    </div>
+    <div class="events-list">
+      ${eventsHtml}
+    </div>
+    <div class="footer">
+      Public Community Calendar • Accessible 24/7 on any device
+    </div>
+  </div>
+</body>
+</html>`;
+  }
+
+  // 1-Click Cloud Schedule Publisher: Generates independent, 24/7 public schedule that requires NO login
+  app.post("/api/publish-schedule", async (req, res) => {
+    try {
+      const { categoryId, categoryName, categoryHex, events, customHtml } = req.body || {};
+      const catKey = (categoryId || 'all').toLowerCase();
+
+      // Ensure fresh database state
+      const freshDb = initDb();
+
+      // Find the active category
+      const activeCat = catKey === 'all' || catKey === 'overview' || catKey === 'sacramentos'
+        ? { id: 'all', name: categoryName || 'Sacramentos', hex: categoryHex || '#4f46e5' }
+        : ((freshDb.categories || []).find((c: any) => c.id.toLowerCase() === catKey || c.name.toLowerCase() === catKey) || {
+            id: categoryId || 'all',
+            name: categoryName || 'Category Schedule',
+            hex: categoryHex || '#4f46e5'
+          });
+
+      const eventsToRender = (events && events.length > 0)
+        ? events
+        : (catKey === 'all' || catKey === 'overview'
+            ? (freshDb.events || [])
+            : (freshDb.events || []).filter((e: any) => e.categoryId === activeCat.id || (e.categoryId && e.categoryId.toLowerCase() === activeCat.id.toLowerCase())));
+
+      // Use client-generated complete multi-month HTML or server-rendered HTML
+      const htmlContent = customHtml && typeof customHtml === 'string' && customHtml.trim()
+        ? customHtml
+        : renderCategoryPdfHtml(activeCat, eventsToRender, freshDb.categories || []);
+
+      // Ensure events are persisted in database
+      if (Array.isArray(events) && events.length > 0) {
+        if (!db.deletedEventIds) db.deletedEventIds = [];
+        const deletedSet = new Set(db.deletedEventIds);
+        const combined = [...(db.events || []), ...events];
+        db.events = deduplicateServerEvents(combined, deletedSet);
+        saveDb(db);
+      }
+
+      // Generate canonical public URL for this category on this hosted domain
+      let host = req.get("x-forwarded-host") || req.get("host") || "localhost:3000";
+      const protocol = req.protocol === 'https' || req.get('x-forwarded-proto') === 'https' ? 'https' : 'http';
+      const baseOrigin = ((db.settings as any)?.publicBaseUrl || '').trim().replace(/\/+$/, '') || `${protocol}://${host}`;
+      const publicUrl = `${baseOrigin}/pdf/${catKey}`;
+
+      // Save to database settings so it is remembered
+      if (!db.settings) db.settings = {} as any;
+      if (!(db.settings as any).independentPdfUrls) (db.settings as any).independentPdfUrls = {};
+      (db.settings as any).independentPdfUrls[catKey] = publicUrl;
+      saveDb(db);
+
+      return res.json({ success: true, url: publicUrl, rawUrl: publicUrl });
+    } catch (err: any) {
+      console.error('Failed to publish public schedule:', err);
+      return res.status(500).json({ error: err.message || 'Failed to publish public schedule' });
+    }
   });
 
 
@@ -4583,10 +6307,10 @@ async function startServer() {
     try {
       const rawParam = req.params.categoryId || 'all';
       const cleanId = rawParam.replace(/\.ics$/, '').trim();
-      const isAll = cleanId.toLowerCase() === 'all' || cleanId.toLowerCase() === 'overview';
+      const isAll = cleanId.toLowerCase() === 'all' || cleanId.toLowerCase() === 'overview' || cleanId.toLowerCase() === 'sacramentos';
       const categories = db.categories || SEED_CATEGORIES;
       const category = isAll
-        ? { id: 'all', name: 'All Categories Master Schedule' }
+        ? { id: 'all', name: 'Sacramentos' }
         : categories.find(c => c.id.toLowerCase() === cleanId.toLowerCase() || c.name.toLowerCase() === cleanId.toLowerCase())
           || { id: cleanId, name: cleanId };
 
@@ -4677,6 +6401,24 @@ async function startServer() {
       console.warn("[Outlook Periodic Sync] Error during background sync:", e);
     }
   }, OUTLOOK_SYNC_INTERVAL_MS);
+
+  // Background Cloud Firestore synchronization every 30 seconds for 24/7 reliability
+  setInterval(async () => {
+    try {
+      await syncDbFromFirestore(db);
+    } catch (e) {}
+  }, 30 * 1000);
+
+  // Initial sync check 1 second after server boots: read Firestore to ensure cloud state is hot
+  setTimeout(async () => {
+    try {
+      console.log("[Firestore Boot Sync] Syncing latest 24/7 cloud events and categories...");
+      await syncDbFromFirestore(db);
+      console.log(`[Firestore Boot Sync] Ready. Active events in memory: ${db.events.length}`);
+    } catch (e) {
+      console.warn("[Firestore Boot Sync Warning]:", e);
+    }
+  }, 1000);
 
   // Initial sync check 5 seconds after server boots
   setTimeout(async () => {

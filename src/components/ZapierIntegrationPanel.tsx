@@ -79,15 +79,7 @@ export const ZapierIntegrationPanel: React.FC<ZapierIntegrationPanelProps> = ({
   // Compute the active webhook URL based on domainMode and urlFormat
   const getComputedWebhookUrl = useCallback(
     (apiKey: string) => {
-      let base = 'https://ais-dev-7l4infuif524ncheylrol3-488950738317.us-east1.run.app';
-      if (domainMode === 'shared') {
-        base = 'https://ais-pre-7l4infuif524ncheylrol3-488950738317.us-east1.run.app';
-      } else if (domainMode === 'browser') {
-        const origin = window.location.origin;
-        if (!origin.includes('localhost') && !origin.includes('127.0.0.1')) {
-          base = origin;
-        }
-      }
+      let base = typeof window !== 'undefined' && window.location?.origin ? window.location.origin : '';
       return urlFormat === 'query'
         ? `${base}/api/webhooks/zapier?apiKey=${apiKey}`
         : `${base}/api/webhooks/zapier`;

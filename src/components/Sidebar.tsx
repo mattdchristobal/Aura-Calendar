@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   ChevronLeft,
   ChevronRight,
@@ -47,12 +47,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   const [miniMonthDate, setMiniMonthDate] = useState(new Date(currentDate));
 
-  const handleMiniPrev = () => {
-    setMiniMonthDate(new Date(miniMonthDate.getFullYear(), miniMonthDate.getMonth() - 1, 1));
+  useEffect(() => {
+    setMiniMonthDate(new Date(currentDate));
+  }, [currentDate]);
+
+  const handleMiniPrev = (e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    const prev = new Date(miniMonthDate.getFullYear(), miniMonthDate.getMonth() - 1, 1);
+    setMiniMonthDate(prev);
+    onSelectDate(prev);
   };
 
-  const handleMiniNext = () => {
-    setMiniMonthDate(new Date(miniMonthDate.getFullYear(), miniMonthDate.getMonth() + 1, 1));
+  const handleMiniNext = (e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    const next = new Date(miniMonthDate.getFullYear(), miniMonthDate.getMonth() + 1, 1);
+    setMiniMonthDate(next);
+    onSelectDate(next);
   };
 
   const daysGrid = getDaysInMonthGrid(miniMonthDate.getFullYear(), miniMonthDate.getMonth(), 0);
@@ -68,16 +78,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </span>
           <div className="flex items-center gap-1">
             <button
+              type="button"
               onClick={handleMiniPrev}
-              className="p-1 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-500 transition-colors"
+              className="w-7 h-7 inline-flex items-center justify-center rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-500 transition-colors cursor-pointer active:scale-95 select-none"
+              title="Previous Month"
+              aria-label="Previous Month"
             >
-              <ChevronLeft className="w-3.5 h-3.5" />
+              <ChevronLeft className="w-4 h-4 pointer-events-none shrink-0" />
             </button>
             <button
+              type="button"
               onClick={handleMiniNext}
-              className="p-1 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-500 transition-colors"
+              className="w-7 h-7 inline-flex items-center justify-center rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-500 transition-colors cursor-pointer active:scale-95 select-none"
+              title="Next Month"
+              aria-label="Next Month"
             >
-              <ChevronRight className="w-3.5 h-3.5" />
+              <ChevronRight className="w-4 h-4 pointer-events-none shrink-0" />
             </button>
           </div>
         </div>
@@ -144,7 +160,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <button
                 onClick={() => onOpenCategoryQr('all')}
                 className="flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-950/60 dark:hover:bg-indigo-900/60 text-indigo-600 dark:text-indigo-400 text-[10px] font-bold transition-colors"
-                title="Generate Master QR Code for All Categories Overview"
+                title="Generate Master QR Code for SACRAMENTOS"
               >
                 <QrCode className="w-3 h-3" />
                 <span>All QR</span>

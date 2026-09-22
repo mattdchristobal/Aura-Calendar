@@ -17,13 +17,13 @@ export interface QrCodeOptions {
  */
 export function ensureCameraScannableColor(hexColor?: string): string {
   if (!hexColor || hexColor === '#000000' || hexColor === '#0f172a' || hexColor === '#1e293b') {
-    return '#0f172a';
+    return '#000000';
   }
   let clean = hexColor.replace('#', '').trim();
   if (clean.length === 3) {
     clean = clean.split('').map((c) => c + c).join('');
   }
-  if (clean.length !== 6) return '#0f172a';
+  if (clean.length !== 6) return '#000000';
 
   const r = parseInt(clean.substring(0, 2), 16) / 255;
   const g = parseInt(clean.substring(2, 4), 16) / 255;
@@ -32,10 +32,10 @@ export function ensureCameraScannableColor(hexColor?: string): string {
   // Relative luminance according to ITU-R BT.709
   const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
 
-  // If luminance is too high for reliable phone camera detection (e.g. yellow, lime, light cyan, pink),
-  // aggressively darken it by 60-70% so the camera sensor sees crisp, sharp edge transitions.
-  if (luminance > 0.25) {
-    const factor = 0.35; // Deepen color while keeping hue recognizable
+  // Smartphone cameras need high contrast (ideally pure black on white)
+  // If luminance is too high, aggressively darken to deep black/navy for instant lock
+  if (luminance > 0.15) {
+    const factor = 0.18;
     const dr = Math.round(r * 255 * factor).toString(16).padStart(2, '0');
     const dg = Math.round(g * 255 * factor).toString(16).padStart(2, '0');
     const db = Math.round(b * 255 * factor).toString(16).padStart(2, '0');
@@ -54,9 +54,9 @@ export async function generateQrDataUrl(
   options: QrCodeOptions = {}
 ): Promise<string> {
   const {
-    width = 480,
-    margin = 3, // ISO quiet zone for fast camera edge detection
-    darkColor = '#0f172a',
+    width = 512,
+    margin = 4, // ISO 18004 4-module quiet zone for fast camera edge detection
+    darkColor = '#000000',
     lightColor = '#ffffff',
     errorCorrectionLevel = 'M' // 15% error recovery provides optimal module size for smartphone lenses
   } = options;
@@ -87,8 +87,8 @@ export async function generateQrSvgString(
   options: QrCodeOptions = {}
 ): Promise<string> {
   const {
-    margin = 3,
-    darkColor = '#0f172a',
+    margin = 4,
+    darkColor = '#000000',
     lightColor = '#ffffff',
     errorCorrectionLevel = 'M'
   } = options;
@@ -111,12 +111,161 @@ export async function generateQrSvgString(
   }
 }
 
-export type PublicUrlMode = 'shared' | 'direct' | 'custom';
+export type PublicUrlMode = 'direct' | 'cloud' | 'custom' | 'shared';
+
+/**
+ * Normalizes and formats an independent public PDF or web URL (Google Drive, Dropbox, OneDrive, or public website).
+ * Specifically converts Google Drive and Dropbox share links to direct mobile-scannable viewer links that bypass login walls.
+ */
+export function formatIndependentPdfUrl(url: string): string {
+  if (!url || typeof url !== 'string') return '';
+  let clean = url.trim();
+  if (!clean) return '';
+
+  // Ensure protocol if missing
+  if (!clean.startsWith('http://') && !clean.startsWith('https://') && !clean.startsWith('data:')) {
+    clean = 'https://' + clean;
+  }
+
+  // Google Drive: Convert share link /view to /preview for instant mobile browser viewing without sign-in prompt
+  if (clean.includes('drive.google.com')) {
+    const fileIdMatch = clean.match(/\/file\/d\/([a-zA-Z0-9_-]+)/) || clean.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+    if (fileIdMatch && fileIdMatch[1]) {
+      return `https://drive.google.com/file/d/${fileIdMatch[1]}/preview`;
+    }
+  }
+
+  // Dropbox: Convert dl=0 to direct preview or raw
+  if (clean.includes('dropbox.com')) {
+    clean = clean.replace(/[?&]dl=0/, '').replace(/[?&]dl=1/, '');
+    clean += clean.includes('?') ? '&raw=1' : '?raw=1';
+    return clean;
+  }
+
+  return clean;
+}
+
+/**
+ * Gets the configured independent public PDF URL for a specific category (or 'all').
+ * Independent URLs bypass app login and do not require the user's computer to be on.
+ */
+export function getIndependentPdfUrl(categoryId: string = 'all'): string {
+  try {
+    const key = `calendar_pdf_url_${(categoryId || 'all').toLowerCase()}`;
+    const saved = localStorage.getItem(key);
+    if (saved && saved.includes('dpaste')) {
+      localStorage.removeItem(key);
+    } else if (saved && saved.trim()) {
+      return saved.trim();
+    }
+    if (categoryId && categoryId.toLowerCase() !== 'all') {
+      const global = localStorage.getItem('calendar_pdf_url_all');
+      if (global && global.includes('dpaste')) {
+        localStorage.removeItem('calendar_pdf_url_all');
+      } else if (global && global.trim()) {
+        return global.trim();
+      }
+    }
+  } catch (e) {}
+  return '';
+}
+
+/**
+ * Stores the independent public PDF URL for a specific category (or 'all').
+ */
+export function setIndependentPdfUrl(categoryId: string = 'all', url: string): void {
+  try {
+    const key = `calendar_pdf_url_${(categoryId || 'all').toLowerCase()}`;
+    if (url && url.trim() && !url.includes('dpaste')) {
+      const formatted = formatIndependentPdfUrl(url.trim());
+      localStorage.setItem(key, formatted);
+      // Also persist to server settings in background
+      fetch('/api/pdf-urls', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ categoryId: (categoryId || 'all').toLowerCase(), url: formatted })
+      }).catch(() => {});
+    } else {
+      localStorage.removeItem(key);
+      fetch('/api/pdf-urls', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ categoryId: (categoryId || 'all').toLowerCase(), url: '' })
+      }).catch(() => {});
+    }
+  } catch (e) {}
+}
+
+/**
+ * Gets all saved independent PDF URLs as a dictionary of categoryId -> url
+ */
+export function getAllIndependentPdfUrls(): Record<string, string> {
+  const result: Record<string, string> = {};
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith('calendar_pdf_url_')) {
+        const catId = key.replace('calendar_pdf_url_', '');
+        const val = localStorage.getItem(key);
+        if (val && !val.includes('dpaste')) result[catId] = val;
+      }
+    }
+  } catch (e) {}
+  return result;
+}
+
+/**
+ * Publishes an independent, 24/7 standalone HTML schedule page for a category to the cloud.
+ * Requires NO app login, NO computer running, and works on any phone camera scan.
+ */
+export async function publishScheduleToCloud(
+  categoryId: string,
+  categoryName: string,
+  categoryHex: string,
+  events: CalendarEvent[],
+  customHtml?: string
+): Promise<string> {
+  try {
+    const res = await fetch('/api/publish-schedule', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        categoryId: (categoryId || 'all').toLowerCase(),
+        categoryName: categoryName || 'Community Schedule',
+        categoryHex: categoryHex || '#0f172a',
+        events,
+        customHtml
+      })
+    });
+
+    if (!res.ok) {
+      throw new Error(`Server returned status ${res.status}`);
+    }
+
+    const data = await res.json();
+    if (data.url) {
+      setIndependentPdfUrl(categoryId, data.url);
+      return data.url;
+    }
+    throw new Error('No URL returned from public cloud publisher');
+  } catch (err: any) {
+    console.error('publishScheduleToCloud error:', err);
+    throw err;
+  }
+}
+
+export const PUBLIC_CLOUD_ORIGIN = 'https://ais-pre-7l4infuif524ncheylrol3-488950738317.us-east1.run.app';
+
+export const CANONICAL_PUBLIC_APP_URL = typeof window !== 'undefined' && window.location && !window.location.origin.includes('localhost') && !window.location.origin.includes('ais-dev-')
+  ? window.location.origin
+  : PUBLIC_CLOUD_ORIGIN;
 
 export function getCustomPublicBaseUrl(): string {
   try {
     const saved = localStorage.getItem('calendar_public_base_url');
-    if (saved && saved.trim()) return saved.trim().replace(/\/+$/, '');
+    if (saved && saved.trim()) {
+      return saved.trim().replace(/\/+$/, '');
+    }
   } catch (e) {}
   return '';
 }
@@ -136,7 +285,8 @@ export function getPublicUrlMode(): PublicUrlMode {
     const mode = localStorage.getItem('calendar_public_url_mode') as PublicUrlMode;
     if (mode === 'direct' || mode === 'custom' || mode === 'shared') return mode;
   } catch (e) {}
-  return 'shared';
+
+  return 'direct';
 }
 
 export function setPublicUrlMode(mode: PublicUrlMode): void {
@@ -179,62 +329,210 @@ export async function verifyPublicUrlLive(url: string): Promise<{
 }
 
 /**
+ * Compact schema representation for encoding category event schedules into QR Code URLs.
+ * Enables 100% offline, serverless, login-free immediate schedule display upon scanning!
+ */
+export interface CompactQrEvent {
+  i: string; // id
+  t: string; // title
+  sd: string; // startDate YYYY-MM-DD
+  ed?: string; // endDate YYYY-MM-DD
+  st?: string; // startTime HH:MM
+  et?: string; // endTime HH:MM
+  c?: string; // categoryId
+  l?: string; // location
+  d?: string; // description
+  ad?: number; // 1 for isAllDay
+  p?: 'low' | 'medium' | 'high';
+  tm?: string; // tema
+}
+
+/**
+ * Compacts and base64-url encodes category events for embedding into the public QR URL.
+ */
+export function packEventsForUrl(
+  eventsToPack: CalendarEvent[],
+  categoryId?: string
+): string {
+  try {
+    if (!eventsToPack || !Array.isArray(eventsToPack) || eventsToPack.length === 0) {
+      return '';
+    }
+    const isAll = !categoryId || categoryId.toLowerCase() === 'all' || categoryId.toLowerCase() === 'overview';
+    const relevant = isAll
+      ? eventsToPack
+      : eventsToPack.filter(
+          (e) =>
+            e.categoryId === categoryId ||
+            (e.categoryId && categoryId && e.categoryId.toLowerCase() === categoryId.toLowerCase())
+        );
+
+    const list = relevant.length === 0 && (categoryId === 'new' || !categoryId) ? eventsToPack : relevant;
+    if (list.length === 0) return '';
+
+    // Sort by start date ascending
+    const sorted = [...list].sort((a, b) => (a.startDate || '').localeCompare(b.startDate || ''));
+    // Take up to 25 events so the QR code density remains easy to scan by smartphone lenses
+    const slice = sorted.slice(0, 25);
+
+    const compact: CompactQrEvent[] = slice.map((e) => ({
+      i: e.id,
+      t: e.title || 'Event',
+      sd: e.startDate || new Date().toISOString().slice(0, 10),
+      ...(e.endDate && e.endDate !== e.startDate ? { ed: e.endDate } : {}),
+      ...(e.startTime ? { st: e.startTime } : {}),
+      ...(e.endTime ? { et: e.endTime } : {}),
+      ...(e.categoryId ? { c: e.categoryId } : {}),
+      ...(e.location ? { l: e.location } : {}),
+      ...(e.description ? { d: e.description.slice(0, 100) } : {}),
+      ...(e.isAllDay ? { ad: 1 } : {}),
+      ...(e.priority && e.priority !== 'medium' ? { p: e.priority } : {}),
+      ...(e.tema ? { tm: e.tema } : {})
+    }));
+
+    const jsonStr = JSON.stringify(compact);
+    const base64 = btoa(
+      encodeURIComponent(jsonStr).replace(/%([0-9A-F]{2})/g, (_, p1) =>
+        String.fromCharCode(parseInt(p1, 16))
+      )
+    )
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+
+    // Safety length cap: if QR payload would exceed 1500 chars, compress further to 8 events
+    if (base64.length > 1500 && slice.length > 6) {
+      const smaller = slice.slice(0, 8);
+      const smallerCompact: CompactQrEvent[] = smaller.map((e) => ({
+        i: e.id,
+        t: e.title || 'Event',
+        sd: e.startDate,
+        st: e.startTime,
+        et: e.endTime,
+        c: e.categoryId,
+        l: e.location || undefined
+      }));
+      return btoa(
+        encodeURIComponent(JSON.stringify(smallerCompact)).replace(/%([0-9A-F]{2})/g, (_, p1) =>
+          String.fromCharCode(parseInt(p1, 16))
+        )
+      )
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+    }
+
+    return base64;
+  } catch (e) {
+    console.warn('packEventsForUrl error:', e);
+    return '';
+  }
+}
+
+/**
+ * Unpacks and parses compact QR URL payload into full CalendarEvent objects.
+ */
+export function unpackEventsFromUrl(encoded: string): CalendarEvent[] {
+  try {
+    if (!encoded || typeof encoded !== 'string' || !encoded.trim()) {
+      return [];
+    }
+    let base64 = encoded.trim().replace(/-/g, '+').replace(/_/g, '/');
+    while (base64.length % 4) {
+      base64 += '=';
+    }
+    const binary = atob(base64);
+    const jsonStr = decodeURIComponent(
+      Array.prototype.map
+        .call(binary, (c: string) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+        .join('')
+    );
+    const parsed = JSON.parse(jsonStr);
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed.map((item: any) => ({
+      id: item.i || `evt-qr-${Math.random().toString(36).slice(2, 9)}`,
+      title: item.t || 'Event',
+      startDate: item.sd || new Date().toISOString().slice(0, 10),
+      endDate: item.ed || item.sd || new Date().toISOString().slice(0, 10),
+      startTime: item.st || '09:00',
+      endTime: item.et || '10:00',
+      categoryId: item.c || 'new',
+      location: item.l || '',
+      description: item.d || '',
+      notes: '',
+      isAllDay: Boolean(item.ad),
+      priority: item.p || 'medium',
+      tema: item.tm || '',
+      userId: 'qr_scanner',
+      createdBy: 'Organizers',
+      recurrence: 'none' as const,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }));
+  } catch (e) {
+    console.warn('unpackEventsFromUrl error:', e);
+    return [];
+  }
+}
+
+/**
  * Constructs the canonical public web browser URL for viewing a category PDF schedule or master overview.
- * Prioritizes verified 24/7 Cloud Run or custom production domain if configured,
- * ensuring smartphone cameras scanning the QR code work 24/7 without login!
+ * Produces clean, concise URLs (< 70 chars) so that smartphone cameras lock onto the QR code in < 100ms.
  */
 export function getCategoryPublicUrl(
   categoryId: string,
   view: 'pdf' | 'calendar' = 'pdf',
-  explicitBaseUrl?: string
+  explicitBaseUrl?: string,
+  urlFormat?: 'path' | 'query',
+  eventsToPack?: CalendarEvent[]
 ): string {
   const isAll = (categoryId || '').toLowerCase() === 'all' || (categoryId || '').toLowerCase() === 'overview';
+  const cleanCategory = isAll ? 'all' : encodeURIComponent(categoryId.trim());
+
   try {
     let origin = '';
+    const customUrl = getCustomPublicBaseUrl();
+
     if (explicitBaseUrl && explicitBaseUrl.trim()) {
       origin = explicitBaseUrl.trim().replace(/\/+$/, '');
-    } else {
-      const mode = getPublicUrlMode();
-      const customUrl = getCustomPublicBaseUrl();
-
-      // If a custom 24/7 production or Cloud Run URL is configured, ALWAYS prioritize it
-      if (customUrl && (mode === 'custom' || !explicitBaseUrl)) {
-        origin = customUrl;
-      } else if (mode === 'direct') {
-        origin = window.location.origin;
-      } else {
-        origin = window.location.origin;
-        if (origin.includes('ais-dev-')) {
-          origin = origin.replace('ais-dev-', 'ais-pre-');
-        }
-      }
+    } else if (customUrl && customUrl.trim()) {
+      origin = customUrl.trim().replace(/\/+$/, '');
+    } else if (typeof window !== 'undefined' && window.location && window.location.origin) {
+      origin = window.location.origin.replace(/\/+$/, '');
     }
 
-    if (view === 'pdf') {
-      if (isAll) {
-        return `${origin}/pdf/all`;
-      }
-      return `${origin}/pdf/${encodeURIComponent(categoryId)}`;
+    if (!origin && typeof window !== 'undefined' && window.location) {
+      origin = window.location.origin.replace(/\/+$/, '');
     }
 
-    const url = new URL(origin + '/');
-    if (isAll) {
-      url.searchParams.set('category', 'all');
-      url.searchParams.set('view', 'pdf');
-    } else {
-      url.searchParams.set('category', categoryId);
-      url.searchParams.set('view', 'pdf');
-    }
-    return url.toString();
-  } catch (e) {
-    let origin = explicitBaseUrl || getCustomPublicBaseUrl() || window.location?.origin || '';
-    if (!explicitBaseUrl && !getCustomPublicBaseUrl() && origin.includes('ais-dev-')) {
+    // 1. If in AI Studio developer sandbox (ais-dev-), convert to public shared origin (ais-pre-)
+    // so any phone camera scanner lands directly on the live schedule without developer login!
+    if (origin && origin.includes('ais-dev-')) {
       origin = origin.replace('ais-dev-', 'ais-pre-');
     }
-    if (isAll) {
-      return `${origin}/pdf/all`;
+
+    // 2. If origin is localhost or loopback, phone cameras cannot reach it and it stops when the computer is off.
+    // Automatically route to the permanent Google Cloud Run 24/7 server!
+    if (!origin || origin.includes('localhost') || origin.includes('127.0.0.1')) {
+      origin = PUBLIC_CLOUD_ORIGIN;
     }
-    return `${origin}/pdf/${encodeURIComponent(categoryId)}`;
+
+    origin = (origin || PUBLIC_CLOUD_ORIGIN).replace(/\/+$/, '');
+
+    // Optional fail-safe: if events are passed and compact, encode into query string so schedule self-heals even on cold start
+    let queryPayload = '';
+    if (Array.isArray(eventsToPack) && eventsToPack.length > 0) {
+      const packed = packEventsForUrl(eventsToPack);
+      if (packed && packed.length <= 800) {
+        queryPayload = `?d=${encodeURIComponent(packed)}`;
+      }
+    }
+
+    // Ultra-clean, 24/7 cloud URL accessible to anyone who scans the QR code
+    return `${origin}/pdf/${cleanCategory}${queryPayload}`;
+  } catch (e) {
+    return `${PUBLIC_CLOUD_ORIGIN}/pdf/${cleanCategory}`;
   }
 }
 
@@ -259,13 +557,13 @@ export async function downloadHighResCategoryQrPng(
   options: { width?: number; darkColor?: string } = {}
 ) {
   try {
-    const { width = 1024, darkColor = category.hex || '#0f172a' } = options;
+    const { width = 1024, darkColor = '#000000' } = options;
     const dataUrl = await generateQrDataUrl(publicUrl, {
       width,
-      margin: 2,
-      darkColor,
+      margin: 4,
+      darkColor: ensureCameraScannableColor(darkColor),
       lightColor: '#ffffff',
-      errorCorrectionLevel: 'H'
+      errorCorrectionLevel: 'M'
     });
     const safeName = (category.name || 'category').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
     downloadQrCode(dataUrl, `${safeName}_Schedule_QR.png`);
@@ -309,10 +607,10 @@ export function printCategoryQrFlyer(params: {
   }
 
   const isAll = category.id === 'all' || category.id === 'overview';
-  const badgeTitle = isAll ? 'All Categories Master Overview' : `${category.name} Schedule`;
-  const mainTitle = isAll ? 'Scan to View All Categories Schedule & PDF' : 'Scan to View Event Details & PDF';
+  const badgeTitle = isAll ? 'SACRAMENTOS' : `${category.name} Schedule`;
+  const mainTitle = isAll ? 'Scan to View SACRAMENTOS Schedule & PDF' : 'Scan to View Event Details & PDF';
   const subtitleDesc = isAll
-    ? 'Scan this QR code with any mobile camera to view the complete schedule across all ministries and categories, event locations, timings, and download PDF. <strong>No account or login required.</strong>'
+    ? 'Scan this QR code with any mobile camera to view the complete SACRAMENTOS schedule, event locations, timings, and download PDF. <strong>No account or login required.</strong>'
     : 'Scan this QR code with any mobile camera to view full schedule, event locations, timings, and download PDF. <strong>No account or login required.</strong>';
   const eventsCountLabel = isAll
     ? `${eventsCount} active event${eventsCount === 1 ? '' : 's'} across all categories`

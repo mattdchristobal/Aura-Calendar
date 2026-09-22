@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   User,
   Role,
@@ -8,7 +8,7 @@ import {
   Category,
   SharedCalendar
 } from './types';
-import { DEFAULT_CATEGORIES, CATEGORY_COLOR_PRESETS, createCategory } from './utils/categories';
+import { DEFAULT_CATEGORIES, CATEGORY_COLOR_PRESETS, createCategory, getCategoryById } from './utils/categories';
 import {
   loadUsers,
   saveUsers,
@@ -70,8 +70,9 @@ import {
   apiSyncOutlook,
   apiUnlinkOutlook
 } from './utils/api';
-import { toYMD, getNearestSunday, isEventOnDate } from './utils/dateUtils';
+import { toYMD, getNearestSunday, isEventOnDate, parseYMD } from './utils/dateUtils';
 import { exportEventsToIcs, downloadIcsFile, fetchIcsFeed, parseIcsContent } from './utils/icsParser';
+import { unpackEventsFromUrl } from './utils/qrUtils';
 
 import { Header } from './components/Header';
 import { Sidebar } from './components/Sidebar';
@@ -91,6 +92,14 @@ import { CategoryPdfDocumentView } from './components/CategoryPdfDocumentView';
 import { CategoryQrModal } from './components/CategoryQrModal';
 import { AnunciosView } from './components/AnunciosView';
 import { PublicAnnouncementPage } from './components/PublicAnnouncementPage';
+import {
+  subscribeToFirestoreEvents,
+  subscribeToFirestoreCategories,
+  saveEventToFirestore,
+  deleteEventFromFirestore,
+  saveCategoryToFirestore,
+  saveSettingsToFirestore
+} from './firebaseSync';
 
 export default function App() {
   // State Initialization
@@ -106,7 +115,26 @@ export default function App() {
     avatarColor: 'bg-indigo-600',
     active: true
   };
-  const [events, setEvents] = useState<CalendarEvent[]>(() => ensureUniqueEventIds(loadEvents()));
+  const [events, setEvents] = useState<CalendarEvent[]>(() => {
+    try {
+      if (typeof window !== 'undefined') {
+        const params = new URLSearchParams(window.location.search);
+        const dataParam = params.get('d') || params.get('data') || params.get('events') || params.get('payload');
+        if (dataParam) {
+          const unpacked = unpackEventsFromUrl(dataParam);
+          if (unpacked.length > 0) {
+            const local = loadEvents();
+            const merged = deduplicateCalendarEvents([...unpacked, ...local]);
+            saveEvents(merged);
+            return ensureUniqueEventIds(merged);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('URL event unpack initialization error:', e);
+    }
+    return ensureUniqueEventIds(loadEvents());
+  });
   const [settings, setSettings] = useState<UserSettings>(() => loadSettings());
   const [categories, setCategories] = useState<Category[]>(() => loadCategories());
   const [shares, setShares] = useState<SharedCalendar[]>(() => loadSharedCalendars());
@@ -301,6 +329,64 @@ export default function App() {
           saveDeletedEventIds(Array.from(localDeletedIds));
         }
 
+        // 3. Categories Bidirectional Merge: preserve custom and default categories, honor valid deletions
+        const localCategories = loadCategories();
+        const activeLocalCatIds = new Set(localCategories.map((c) => c.id).filter(Boolean));
+        const localDeletedCatIds = loadDeletedCategoryIds();
+
+        // Any category actively present on the server was created/approved by an Admin
+        // and must NEVER be treated as deleted locally! Unshield immediately.
+        if (Array.isArray(serverData.categories)) {
+          serverData.categories.forEach((c) => {
+            if (c && c.id) {
+              localDeletedCatIds.delete(c.id);
+              clearDeletedCategoryId(c.id);
+            }
+          });
+        }
+
+        // Active local categories must also NEVER be treated as deleted
+        activeLocalCatIds.forEach((id) => {
+          localDeletedCatIds.delete(id);
+          clearDeletedCategoryId(id);
+        });
+
+        if (Array.isArray(serverData.deletedCategoryIds) && serverData.deletedCategoryIds.length > 0) {
+          const activeServerCatIds = new Set((serverData.categories || []).map((c: any) => c?.id).filter(Boolean));
+          const trueDeleted = serverData.deletedCategoryIds.filter(
+            (id) => !activeLocalCatIds.has(id) && !activeServerCatIds.has(id)
+          );
+          recordDeletedCategoryIds(trueDeleted);
+          trueDeleted.forEach((id) => localDeletedCatIds.add(id));
+        }
+
+        const catMap = new Map<string, Category>();
+
+        // Merge server categories first
+        if (Array.isArray(serverData.categories)) {
+          serverData.categories.forEach((c) => {
+            if (c && c.id && !localDeletedCatIds.has(c.id)) {
+              catMap.set(c.id, c);
+            }
+          });
+        }
+
+        // Populate local categories that aren't deleted
+        localCategories.forEach((c) => {
+          if (c && c.id && !localDeletedCatIds.has(c.id)) {
+            if (!catMap.has(c.id)) {
+              catMap.set(c.id, c);
+            }
+          }
+        });
+
+        // Ensure default categories are preserved if not deleted
+        DEFAULT_CATEGORIES.forEach((c) => {
+          if (c && c.id && !localDeletedCatIds.has(c.id) && !catMap.has(c.id)) {
+            catMap.set(c.id, c);
+          }
+        });
+
         // Reconcile with local cache:
         // Local creations/edits are preserved and pushed to cloud
         const offlineEventsToPush: CalendarEvent[] = [];
@@ -332,16 +418,61 @@ export default function App() {
         const rawMergedEvents = deduplicateCalendarEvents(
           Array.from(serverEventMap.values()).filter(e => hasValidOutlookLink || !isOutlookEvent(e))
         );
-        // Ensure any legacy 'client' events map to active category (e.g. 'new')
-        const activeCatList = (Array.isArray(serverData.categories) && serverData.categories.length > 0)
-          ? serverData.categories
-          : categories;
-        const primaryCatId = (activeCatList[0] && activeCatList[0].id) || 'new';
-        const activeCatIds = new Set(activeCatList.map((c: any) => c.id));
 
+        // STRICT PERSISTENCE GUARANTEE:
+        // NEVER alter or overwrite any event's categoryId!
+        // For any category present on an event, ensure it exists in catMap and is not marked deleted
+        rawMergedEvents.forEach((e) => {
+          if (e && e.categoryId) {
+            localDeletedCatIds.delete(e.categoryId);
+            clearDeletedCategoryId(e.categoryId);
+            if (!catMap.has(e.categoryId)) {
+              const resolvedCat = getCategoryById(e.categoryId, Array.from(catMap.values()));
+              catMap.set(e.categoryId, resolvedCat);
+            }
+          }
+        });
+
+        saveDeletedCategoryIds(Array.from(localDeletedCatIds));
+        const mergedCategories = Array.from(catMap.values());
+        if (mergedCategories.length > 0) {
+          setCategories(mergedCategories);
+          saveCategories(mergedCategories);
+
+          // Update selectedCategoryIds: ensure all active and event categories are selected
+          setSelectedCategoryIds((prev) => {
+            const validIds = new Set(mergedCategories.map((c) => c.id));
+            rawMergedEvents.forEach((e) => {
+              if (e && e.categoryId) validIds.add(e.categoryId);
+            });
+            const prevSet = new Set(prev.filter((id) => validIds.has(id)));
+            validIds.forEach((id) => prevSet.add(id));
+            const result = Array.from(prevSet);
+            return result.length > 0 ? result : mergedCategories.map((c) => c.id);
+          });
+
+          // Discrepancy push to server ONLY by Admin users to prevent member profiles from overwriting admin changes
+          const activeRole = currentUser?.role || (effectiveUser ? effectiveUser.role : undefined);
+          const isAdmin = activeRole === 'admin';
+          if (isAdmin) {
+            const serverCatIds = new Set((serverData.categories || []).map((c) => c.id));
+            const hasServerDiscrepancy =
+              mergedCategories.some((c) => !serverCatIds.has(c.id)) ||
+              (serverData.categories || []).some((c) => localDeletedCatIds.has(c.id));
+            if (hasServerDiscrepancy) {
+              apiBulkSaveCategories(mergedCategories).catch(() => {});
+              apiPushSyncData({
+                categories: mergedCategories,
+                deletedCategoryIds: Array.from(localDeletedCatIds)
+              }).catch(() => {});
+            }
+          }
+        }
+
+        // Keep original category assignment for all events intact without any modification
         const mergedEvents = rawMergedEvents.map((e) => {
-          if (!e.categoryId || e.categoryId === 'client' || !activeCatIds.has(e.categoryId)) {
-            return { ...e, categoryId: primaryCatId };
+          if (!e.categoryId) {
+            return { ...e, categoryId: (mergedCategories[0] && mergedCategories[0].id) || 'work' };
           }
           return e;
         });
@@ -364,96 +495,6 @@ export default function App() {
           apiSaveSettings(mergedSettings).catch(() => {});
         } else if (JSON.stringify(serverData.settings) !== JSON.stringify(mergedSettings)) {
           apiSaveSettings(mergedSettings).catch(() => {});
-        }
-
-        // 3. Categories Bidirectional Merge: preserve custom categories and honor deleted categories
-        const localCategories = loadCategories();
-        const activeLocalCatIds = new Set(localCategories.map((c) => c.id).filter(Boolean));
-        const localDeletedCatIds = loadDeletedCategoryIds();
-
-        // CRITICAL: Any category actively present on the server was created/approved by an Admin
-        // and must NEVER be treated as deleted locally! Unshield immediately.
-        if (Array.isArray(serverData.categories)) {
-          serverData.categories.forEach((c) => {
-            if (c && c.id) {
-              localDeletedCatIds.delete(c.id);
-              clearDeletedCategoryId(c.id);
-            }
-          });
-        }
-
-        // Active local categories must also NEVER be treated as deleted
-        activeLocalCatIds.forEach((id) => {
-          localDeletedCatIds.delete(id);
-          clearDeletedCategoryId(id);
-        });
-        saveDeletedCategoryIds(Array.from(localDeletedCatIds));
-
-        if (Array.isArray(serverData.deletedCategoryIds) && serverData.deletedCategoryIds.length > 0) {
-          const activeServerCatIds = new Set((serverData.categories || []).map((c: any) => c?.id).filter(Boolean));
-          // Only adopt deletions for categories that are NOT present locally AND not present on server
-          const trueDeleted = serverData.deletedCategoryIds.filter(
-            (id) => !activeLocalCatIds.has(id) && !activeServerCatIds.has(id)
-          );
-          recordDeletedCategoryIds(trueDeleted);
-          trueDeleted.forEach((id) => localDeletedCatIds.add(id));
-        }
-
-        const catMap = new Map<string, Category>();
-
-        // Merge server categories first (authoritative from admin)
-        if (Array.isArray(serverData.categories)) {
-          serverData.categories.forEach((c) => {
-            if (c && c.id && !localDeletedCatIds.has(c.id)) {
-              catMap.set(c.id, c);
-            }
-          });
-        }
-
-        // Populate local categories that aren't deleted
-        localCategories.forEach((c) => {
-          if (c && c.id && !localDeletedCatIds.has(c.id)) {
-            if (!catMap.has(c.id)) {
-              catMap.set(c.id, c);
-            }
-          }
-        });
-
-        const mergedCategories = Array.from(catMap.values());
-        if (mergedCategories.length > 0) {
-          setCategories(mergedCategories);
-          saveCategories(mergedCategories);
-
-          // Update selectedCategoryIds: preserve existing selections, AND automatically activate newly added categories so they appear immediately on the calendar & filters
-          setSelectedCategoryIds((prev) => {
-            const validIds = new Set(mergedCategories.map((c) => c.id));
-            const prevSet = new Set(prev.filter((id) => validIds.has(id)));
-            // Ensure any newly discovered category from server is selected by default
-            mergedCategories.forEach((c) => {
-              if (!activeLocalCatIds.has(c.id) || prevSet.size === 0) {
-                prevSet.add(c.id);
-              }
-            });
-            const result = Array.from(prevSet);
-            return result.length > 0 ? result : mergedCategories.map((c) => c.id);
-          });
-
-          // Discrepancy push to server ONLY by Admin users to prevent member profiles from overwriting admin changes
-          const activeRole = currentUser?.role || (effectiveUser ? effectiveUser.role : undefined);
-          const isAdmin = activeRole === 'admin';
-          if (isAdmin) {
-            const serverCatIds = new Set((serverData.categories || []).map((c) => c.id));
-            const hasServerDiscrepancy =
-              mergedCategories.some((c) => !serverCatIds.has(c.id)) ||
-              (serverData.categories || []).some((c) => localDeletedCatIds.has(c.id));
-            if (hasServerDiscrepancy) {
-              apiBulkSaveCategories(mergedCategories).catch(() => {});
-              apiPushSyncData({
-                categories: mergedCategories,
-                deletedCategoryIds: Array.from(localDeletedCatIds)
-              }).catch(() => {});
-            }
-          }
         }
 
         // 4. Shares Merge
@@ -513,12 +554,28 @@ export default function App() {
 
       const params = new URLSearchParams(window.location.search);
       const shareCode = params.get('share') || params.get('code');
-      const catParam = params.get('category') || params.get('cat');
+      const catParam = params.get('category') || params.get('cat') || params.get('pdf');
       const viewParam = params.get('view');
       const tabParam = params.get('tab');
+      const anuncioId = params.get('id') || params.get('anuncio') || params.get('announcement');
+      const dataParam = params.get('d') || params.get('data') || params.get('events') || params.get('payload');
 
-      if (viewParam === 'anuncio' || viewParam === 'anuncios' || tabParam === 'anuncios') {
+      if (dataParam) {
+        const unpacked = unpackEventsFromUrl(dataParam);
+        if (unpacked.length > 0) {
+          setEvents((prev) => {
+            const merged = deduplicateCalendarEvents([...unpacked, ...prev]);
+            saveEvents(merged);
+            return ensureUniqueEventIds(merged);
+          });
+        }
+      }
+
+      if (viewParam === 'anuncio' || viewParam === 'anuncios' || tabParam === 'anuncios' || params.has('anuncio')) {
         setIsPublicAnnouncement(true);
+        if (anuncioId && anuncioId !== 'true') {
+          setPublicAnnouncementId(decodeURIComponent(anuncioId).trim());
+        }
         return;
       }
 
@@ -550,6 +607,69 @@ export default function App() {
     };
   }, [syncWithServer]);
 
+  // 24/7 Real-Time Cloud Firestore Sync: listen to remote events and categories
+  useEffect(() => {
+    const unsubEvents = subscribeToFirestoreEvents((cloudEvents) => {
+      if (!cloudEvents || cloudEvents.length === 0) return;
+      setEvents((prev) => {
+        const deletedSet = loadDeletedEventIds();
+        const cleanCloud = cloudEvents.filter((e) => e && e.id && !deletedSet.has(e.id));
+        if (cleanCloud.length === 0) return prev;
+        const merged = deduplicateCalendarEvents([...prev, ...cleanCloud]);
+        if (JSON.stringify(prev) !== JSON.stringify(merged)) {
+          saveEvents(merged);
+          return merged;
+        }
+        return prev;
+      });
+      // Ensure category IDs for received events are in selectedCategoryIds so they are immediately visible
+      setSelectedCategoryIds((prev) => {
+        const prevSet = new Set(prev);
+        let changed = false;
+        cloudEvents.forEach((e) => {
+          if (e && e.categoryId && !prevSet.has(e.categoryId)) {
+            prevSet.add(e.categoryId);
+            changed = true;
+          }
+        });
+        return changed ? Array.from(prevSet) : prev;
+      });
+    });
+
+    const unsubCategories = subscribeToFirestoreCategories((cloudCats) => {
+      if (!cloudCats || cloudCats.length === 0) return;
+      setCategories((prev) => {
+        const deletedSet = loadDeletedCategoryIds();
+        const cleanCloud = cloudCats.filter((c) => c && c.id && !deletedSet.has(c.id));
+        if (cleanCloud.length === 0) return prev;
+        const catMap = new Map<string, Category>(prev.map((c) => [c.id, c]));
+        cleanCloud.forEach((c) => catMap.set(c.id, c));
+        const merged = Array.from(catMap.values());
+        if (JSON.stringify(prev) !== JSON.stringify(merged)) {
+          saveCategories(merged);
+          return merged;
+        }
+        return prev;
+      });
+      setSelectedCategoryIds((prev) => {
+        const prevSet = new Set(prev);
+        let changed = false;
+        cloudCats.forEach((c) => {
+          if (c && c.id && !prevSet.has(c.id)) {
+            prevSet.add(c.id);
+            changed = true;
+          }
+        });
+        return changed ? Array.from(prevSet) : prev;
+      });
+    });
+
+    return () => {
+      unsubEvents();
+      unsubCategories();
+    };
+  }, []);
+
   const [currentDate, setCurrentDate] = useState<Date>(new Date());
   const [view, setView] = useState<ViewType>('month');
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
@@ -558,11 +678,66 @@ export default function App() {
     setIsSidebarOpen((prev) => !prev);
   };
 
-  // Filter & Search
-  const [selectedCategoryIds, setSelectedCategoryIds] = useState<string[]>(
-    () => loadCategories().map((c) => c.id)
-  );
+  // Filter & Search: initialize with all category IDs and all event category IDs
+  const [selectedCategoryIds, setSelectedCategoryIds] = useState<string[]>(() => {
+    const cats = loadCategories();
+    const evts = loadEvents();
+    const ids = new Set(cats.map((c) => c.id));
+    evts.forEach((e) => {
+      if (e && e.categoryId) ids.add(e.categoryId);
+    });
+    return Array.from(ids);
+  });
   const [searchQuery, setSearchQuery] = useState('');
+
+  // Keep selectedCategoryIds synchronized so newly created, synced, or event-attached categories are never accidentally hidden
+  useEffect(() => {
+    setSelectedCategoryIds((prev) => {
+      const allKnownIds = new Set<string>();
+      categories.forEach((c) => { if (c && c.id) allKnownIds.add(c.id); });
+      events.forEach((e) => { if (e && e.categoryId) allKnownIds.add(e.categoryId); });
+
+      if (allKnownIds.size === 0) return prev;
+
+      const prevSet = new Set(prev);
+      let changed = false;
+      allKnownIds.forEach((id) => {
+        if (!prevSet.has(id)) {
+          prevSet.add(id);
+          changed = true;
+        }
+      });
+      return changed ? Array.from(prevSet) : prev;
+    });
+  }, [categories, events]);
+
+  // Smart initial calendar date navigation:
+  // If the current month has 0 events, but user has scheduled events in an upcoming month (e.g. October 2026),
+  // automatically navigate to that month on initial load so the user immediately sees all their events!
+  const hasAutoNavigatedDateRef = useRef(false);
+  useEffect(() => {
+    if (hasAutoNavigatedDateRef.current || !events || events.length === 0) return;
+
+    const today = new Date();
+    const curYm = toYMD(today).slice(0, 7);
+    const hasCurrentMonthEvents = events.some((e) => (e.startDate || '').startsWith(curYm));
+
+    if (!hasCurrentMonthEvents) {
+      const upcomingEvents = events
+        .filter((e) => e.startDate && e.startDate >= toYMD(today))
+        .sort((a, b) => (a.startDate || '').localeCompare(b.startDate || ''));
+
+      if (upcomingEvents.length > 0 && upcomingEvents[0].startDate) {
+        const firstDate = parseYMD(upcomingEvents[0].startDate);
+        if (!isNaN(firstDate.getTime())) {
+          setCurrentDate(firstDate);
+          hasAutoNavigatedDateRef.current = true;
+        }
+      }
+    } else {
+      hasAutoNavigatedDateRef.current = true;
+    }
+  }, [events]);
 
   // Modals & Drawers
   const [isEventModalOpen, setIsEventModalOpen] = useState(false);
@@ -629,11 +804,13 @@ export default function App() {
     const d = new Date(currentDate);
     if (view === 'year') {
       d.setFullYear(d.getFullYear() - 1);
-    } else if (view === 'month') {
+    } else if (view === 'month' || view === 'anuncios') {
+      const origDay = d.getDate();
+      d.setDate(1);
       d.setMonth(d.getMonth() - 1);
-    } else if (view === 'week') {
-      d.setDate(d.getDate() - 7);
-    } else if (view === 'sunday') {
+      const maxDays = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+      d.setDate(Math.min(origDay, maxDays));
+    } else if (view === 'week' || view === 'sunday') {
       d.setDate(d.getDate() - 7);
     } else {
       d.setDate(d.getDate() - 1);
@@ -645,11 +822,13 @@ export default function App() {
     const d = new Date(currentDate);
     if (view === 'year') {
       d.setFullYear(d.getFullYear() + 1);
-    } else if (view === 'month') {
+    } else if (view === 'month' || view === 'anuncios') {
+      const origDay = d.getDate();
+      d.setDate(1);
       d.setMonth(d.getMonth() + 1);
-    } else if (view === 'week') {
-      d.setDate(d.getDate() + 7);
-    } else if (view === 'sunday') {
+      const maxDays = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+      d.setDate(Math.min(origDay, maxDays));
+    } else if (view === 'week' || view === 'sunday') {
       d.setDate(d.getDate() + 7);
     } else {
       d.setDate(d.getDate() + 1);
@@ -785,8 +964,25 @@ export default function App() {
     if (savedEvt.externalEventId) {
       clearDeletedEventId(savedEvt.externalEventId);
     }
+
+    if (savedEvt.categoryId) {
+      clearDeletedCategoryId(savedEvt.categoryId);
+      const catExists = categories.some((c) => c.id === savedEvt.categoryId);
+      if (!catExists) {
+        const resolvedCat = getCategoryById(savedEvt.categoryId, categories);
+        const nextCats = [...categories, resolvedCat];
+        setCategories(nextCats);
+        saveCategories(nextCats);
+        apiSaveCategory(resolvedCat).catch(() => {});
+      }
+      setSelectedCategoryIds((prev) => (prev.includes(savedEvt.categoryId) ? prev : [...prev, savedEvt.categoryId]));
+    }
+
     setEvents(updatedEvents);
     saveEvents(updatedEvents);
+
+    // Persist directly to Firestore 24/7 cloud storage
+    saveEventToFirestore(savedEvt).catch(() => {});
 
     // Persist directly to cloud server
     const serverResult = await apiSaveEvent(savedEvt);
@@ -810,6 +1006,11 @@ export default function App() {
       recordDeletedEventId(targetEvt.externalEventId);
     }
     deleteEventFromStorage(eventId);
+    // Remove immediately from 24/7 Cloud Firestore
+    deleteEventFromFirestore(eventId).catch(() => {});
+    if (targetEvt?.externalEventId) {
+      deleteEventFromFirestore(targetEvt.externalEventId).catch(() => {});
+    }
     setEvents((prev) => {
       const updated = prev.filter(
         (e) =>
@@ -859,6 +1060,7 @@ export default function App() {
   const handleSaveSettings = (newSettings: UserSettings) => {
     setSettings(newSettings);
     saveSettings(newSettings);
+    saveSettingsToFirestore(newSettings).catch(() => {});
     apiSaveSettings(newSettings);
   };
 
@@ -1274,6 +1476,7 @@ export default function App() {
     });
 
     try {
+      saveCategoryToFirestore(category).catch(() => {});
       await apiSaveCategory(category);
       if (nextCategories.length > 0) {
         await apiBulkSaveCategories(nextCategories);
@@ -1599,12 +1802,14 @@ export default function App() {
   // If viewing a Category PDF document (e.g. opened via QR code scan or link)
   if (pdfCategoryViewId) {
     const isAll =
-      pdfCategoryViewId.toLowerCase() === 'all' || pdfCategoryViewId.toLowerCase() === 'overview';
+      pdfCategoryViewId.toLowerCase() === 'all' ||
+      pdfCategoryViewId.toLowerCase() === 'overview' ||
+      pdfCategoryViewId.toLowerCase() === 'sacramentos';
 
     const activePdfCat: Category = isAll
       ? {
           id: 'all',
-          name: 'All Categories Overview',
+          name: 'SACRAMENTOS',
           hex: '#4f46e5',
           color: 'indigo',
           bgClass: 'bg-indigo-50 dark:bg-indigo-950/40',
@@ -1618,18 +1823,26 @@ export default function App() {
           (c) =>
             c.id.toLowerCase() === pdfCategoryViewId.toLowerCase() ||
             c.name.toLowerCase() === pdfCategoryViewId.toLowerCase()
-        ) || categories[0];
+        ) ||
+        categories[0] || {
+          id: pdfCategoryViewId,
+          name: pdfCategoryViewId.charAt(0).toUpperCase() + pdfCategoryViewId.slice(1),
+          hex: '#4f46e5',
+          color: 'indigo',
+          bgClass: 'bg-indigo-50 dark:bg-indigo-950/40',
+          borderClass: 'border-indigo-200 dark:border-indigo-800',
+          textClass: 'text-indigo-700 dark:text-indigo-300',
+          badgeClass: 'bg-indigo-100 dark:bg-indigo-900 text-indigo-800 dark:text-indigo-200',
+          dotClass: 'bg-indigo-500',
+          description: `Schedule for ${pdfCategoryViewId}`
+        };
 
     if (activePdfCat) {
-      let catEvents = isAll ? events : events.filter((e) => e.categoryId === activePdfCat.id);
-      if (catEvents.length === 0 && events.length > 0 && (categories.length <= 1 || activePdfCat.id === 'new')) {
-        catEvents = events;
-      }
       return (
         <CategoryPdfDocumentView
           category={activePdfCat}
           allCategories={categories}
-          events={catEvents}
+          events={events}
           settings={settings}
           onSelectCategory={(id) => setPdfCategoryViewId(id)}
           onBackToApp={handleCloseCategoryPdf}
@@ -1823,6 +2036,7 @@ export default function App() {
               events={displayEvents}
               currentUser={currentUser}
               onBackToCalendar={() => setView('month')}
+              onOpenSacramentosPdf={() => setPdfCategoryViewId('all')}
             />
           )}
 

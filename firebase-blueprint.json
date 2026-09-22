@@ -1,0 +1,93 @@
+{
+  "entities": {
+    "CalendarEvent": {
+      "title": "CalendarEvent",
+      "description": "Church calendar event",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "location": {
+          "type": "string"
+        },
+        "startDate": {
+          "type": "string"
+        },
+        "endDate": {
+          "type": "string"
+        },
+        "startTime": {
+          "type": "string"
+        },
+        "endTime": {
+          "type": "string"
+        },
+        "categoryId": {
+          "type": "string"
+        },
+        "tema": {
+          "type": "string"
+        },
+        "userId": {
+          "type": "string"
+        },
+        "createdBy": {
+          "type": "string"
+        },
+        "isAllDay": {
+          "type": "boolean"
+        },
+        "notes": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "string"
+        }
+      },
+      "required": ["id", "title", "startDate", "endDate", "categoryId"]
+    },
+    "Category": {
+      "title": "Category",
+      "description": "Calendar event category or ministry",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "color": {
+          "type": "string"
+        },
+        "hex": {
+          "type": "string"
+        }
+      },
+      "required": ["id", "name"]
+    }
+  },
+  "firestore": {
+    "/events/{eventId}": {
+      "schema": "CalendarEvent",
+      "description": "Public and administrative calendar events"
+    },
+    "/categories/{categoryId}": {
+      "schema": "Category",
+      "description": "Calendar categories"
+    }
+  }
+}

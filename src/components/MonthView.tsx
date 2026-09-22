@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { CalendarEvent, Category, UserSettings } from '../types';
 import {
   getDaysInMonthGrid,
@@ -67,8 +67,46 @@ export const MonthView: React.FC<MonthViewProps> = ({
     );
   });
 
+  const currentMonthYm = `${year}-${String(month + 1).padStart(2, '0')}`;
+  const currentMonthEventsCount = filteredEvents.filter((e) => (e.startDate || '').startsWith(currentMonthYm)).length;
+
+  // Find nearest upcoming month with events if current displayed month has 0 events
+  const upcomingMonthWithEvents = useMemo(() => {
+    if (currentMonthEventsCount > 0) return null;
+    const upcoming = filteredEvents
+      .filter((e) => (e.startDate || '') > `${currentMonthYm}-31`)
+      .sort((a, b) => (a.startDate || '').localeCompare(b.startDate || ''));
+    if (upcoming.length === 0) return null;
+    const firstEvt = upcoming[0];
+    const ym = (firstEvt.startDate || '').slice(0, 7);
+    if (!ym) return null;
+    const count = filteredEvents.filter((e) => (e.startDate || '').startsWith(ym)).length;
+    const parts = ym.split('-').map(Number);
+    const d = new Date(parts[0], parts[1] - 1, 1);
+    const monthName = d.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+    return { ym, date: d, monthName, count };
+  }, [currentMonthEventsCount, filteredEvents, currentMonthYm]);
+
   return (
     <div className="flex-1 flex flex-col h-full bg-white dark:bg-slate-950 overflow-hidden">
+      {upcomingMonthWithEvents && (
+        <div className="bg-indigo-50 dark:bg-indigo-950/60 border-b border-indigo-100 dark:border-indigo-900/60 px-4 py-2 flex items-center justify-between gap-3 text-xs z-10 shrink-0">
+          <div className="flex items-center gap-2 text-indigo-950 dark:text-indigo-200">
+            <span className="w-2 h-2 rounded-full bg-indigo-600 animate-pulse shrink-0" />
+            <span>
+              You have <strong>{upcomingMonthWithEvents.count} events</strong> scheduled in{' '}
+              <strong>{upcomingMonthWithEvents.monthName}</strong>
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => onSelectDate(upcomingMonthWithEvents.date)}
+            className="px-3 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-bold transition-all shadow-xs cursor-pointer active:scale-95 shrink-0"
+          >
+            View {upcomingMonthWithEvents.monthName} →
+          </button>
+        </div>
+      )}
       
       {/* Weekday Header Row */}
       <div className="grid grid-cols-7 border-b border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/50">

@@ -110,7 +110,14 @@ export function isOutlookEvent(evt: Partial<CalendarEvent> | null | undefined): 
         }
       } catch (e) {}
     }
-    if (eventMap.size > 0 || !hasValidOutlookLink) {
+    if (eventMap.size === 0 && Array.isArray(SEED_EVENTS) && SEED_EVENTS.length > 0) {
+      SEED_EVENTS.forEach((e) => {
+        if (e && e.id && !deletedSet.has(e.id)) {
+          eventMap.set(e.id, e);
+        }
+      });
+    }
+    if (eventMap.size > 0) {
       const allEvents = Array.from(eventMap.values());
       localStorage.setItem(KEYS.EVENTS, JSON.stringify(allEvents));
       localStorage.setItem(KEYS.PERMANENT_EVENTS_VAULT, JSON.stringify(allEvents));
@@ -740,7 +747,7 @@ export function deduplicateCalendarEvents(eventsList: CalendarEvent[]): Calendar
       const existing = resultMap.get(targetKey)!;
       const evtTime = evt.updatedAt ? new Date(evt.updatedAt).getTime() : 0;
       const existTime = existing.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
-      const isEvtNewer = evtTime >= existTime;
+      const isEvtNewer = evtTime > existTime;
 
       // Prioritize admin customizations
       if (evt.customizedByAdmin && !existing.customizedByAdmin) {
@@ -768,19 +775,21 @@ export function deduplicateCalendarEvents(eventsList: CalendarEvent[]): Calendar
           adminEditedBy: existing.adminEditedBy
         });
       } else if (isEvtNewer) {
-        // Incoming event is newer: keep incoming updates
+        // Incoming event is strictly newer: keep incoming updates
         resultMap.set(targetKey, {
           ...existing,
           ...evt,
           id: existing.id,
+          categoryId: evt.categoryId || existing.categoryId,
           updatedAt: evt.updatedAt || existing.updatedAt || new Date().toISOString()
         });
       } else {
-        // Existing event is newer
+        // Existing event is newer or equal: preserve existing category and fields
         resultMap.set(targetKey, {
           ...evt,
           ...existing,
-          id: existing.id
+          id: existing.id,
+          categoryId: existing.categoryId || evt.categoryId
         });
       }
     } else {
@@ -850,6 +859,17 @@ export function loadEvents(): CalendarEvent[] {
     }
   } catch (e) {}
 
+  if (filtered.length === 0 && Array.isArray(SEED_EVENTS) && SEED_EVENTS.length > 0) {
+    const unDeletedSeeds = SEED_EVENTS.filter((e) => e && e.id && !deletedSet.has(e.id));
+    if (unDeletedSeeds.length > 0) {
+      try {
+        localStorage.setItem(KEYS.EVENTS, JSON.stringify(unDeletedSeeds));
+        localStorage.setItem(KEYS.PERMANENT_EVENTS_VAULT, JSON.stringify(unDeletedSeeds));
+      } catch (e) {}
+      return unDeletedSeeds;
+    }
+  }
+
   return filtered;
 }
 
@@ -888,6 +908,14 @@ export function deleteEventFromStorage(eventId: string): void {
     );
     localStorage.setItem(KEYS.EVENTS, JSON.stringify(current));
     localStorage.setItem(KEYS.PERMANENT_EVENTS_VAULT, JSON.stringify(current));
+
+    // Sync deletion to cloud server database
+    if (typeof window !== 'undefined' && eventId) {
+      fetch(`/api/events/${encodeURIComponent(eventId)}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' }
+      }).catch(() => {});
+    }
 
     // Clean from legacy keys as well to ensure it cannot be resurrected
     const legacyKeys = [

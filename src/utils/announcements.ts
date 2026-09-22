@@ -152,25 +152,20 @@ export function getAnnouncementPublicUrl(announcementId?: string, customBaseUrl?
   try {
     const configuredCustom = customBaseUrl || getCustomPublicBaseUrl();
     const isCustom = !!configuredCustom && configuredCustom.trim().length > 0;
-    let base = isCustom ? configuredCustom!.trim().replace(/\/+$/, '') : window.location.origin;
-    if (!isCustom) {
-      if (base.includes('ais-dev-')) {
-        base = base.replace('ais-dev-', 'ais-pre-');
-      }
-      const currentHost = window.location.hostname;
-      const isSharedSubdomain = currentHost.includes('ais-pre-') || currentHost.includes('run.app');
-      if (!isSharedSubdomain && currentHost.includes('ai.studio')) {
-        const match = currentHost.match(/^(?:https?:\/\/)?([a-z0-9-]+)\./i);
-        const appletId = match ? match[1] : '';
-        if (appletId) {
-          base = `https://ais-pre-${appletId}.run.app`;
-        }
-      }
+    let base = isCustom ? configuredCustom!.trim().replace(/\/+$/, '') : (typeof window !== 'undefined' ? window.location.origin : '');
+    base = (base || '').replace(/\/+$/, '');
+
+    if (base.includes('ais-dev-')) {
+      base = base.replace('ais-dev-', 'ais-pre-');
     }
+    if (!base || base.includes('localhost') || base.includes('127.0.0.1')) {
+      base = 'https://ais-pre-7l4infuif524ncheylrol3-488950738317.us-east1.run.app';
+    }
+
     const id = announcementId || getActiveAnnouncement().id;
     return `${base}/anuncio/${encodeURIComponent(id)}`;
   } catch (e) {
-    return window.location?.href || '';
+    return `https://ais-pre-7l4infuif524ncheylrol3-488950738317.us-east1.run.app/anuncio/${encodeURIComponent(announcementId || 'default')}`;
   }
 }
 
@@ -231,4 +226,113 @@ export function createAnnouncementFromEvent(
     linkedEventId: event.id,
     updatedAt: new Date().toISOString()
   };
+}
+
+export interface AnuncioPdfInfo {
+  id?: string;
+  filename: string;
+  fileSize: number;
+  mimeType: string;
+  uploadedAt: string;
+  url: string;
+  dataUrl?: string;
+}
+
+const PDF_STORAGE_KEY = 'pro_calendar_anuncio_pdf_v1';
+
+export function loadAnuncioPdfFromStorage(): AnuncioPdfInfo | null {
+  try {
+    const raw = localStorage.getItem(PDF_STORAGE_KEY);
+    if (raw) {
+      return JSON.parse(raw);
+    }
+  } catch (e) {
+    console.warn('Error loading Anuncio PDF from storage:', e);
+  }
+  return null;
+}
+
+export function saveAnuncioPdfToStorage(pdf: AnuncioPdfInfo | null): void {
+  try {
+    if (!pdf) {
+      localStorage.removeItem(PDF_STORAGE_KEY);
+    } else {
+      const toSave = { ...pdf };
+      if (toSave.dataUrl && toSave.dataUrl.length > 2000000) {
+        delete toSave.dataUrl;
+      }
+      localStorage.setItem(PDF_STORAGE_KEY, JSON.stringify(toSave));
+    }
+  } catch (e) {
+    console.warn('Error saving Anuncio PDF to storage:', e);
+  }
+}
+
+export async function fetchAnuncioPdfInfo(): Promise<AnuncioPdfInfo | null> {
+  try {
+    const res = await fetch('/api/anuncio/pdf/info');
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.hasPdf && data.pdf) {
+        saveAnuncioPdfToStorage(data.pdf);
+        return data.pdf;
+      } else {
+        saveAnuncioPdfToStorage(null);
+        return null;
+      }
+    }
+  } catch (e) {
+    console.warn('Error fetching Anuncio PDF info:', e);
+  }
+  return loadAnuncioPdfFromStorage();
+}
+
+export async function uploadAnuncioPdfFile(file: File): Promise<AnuncioPdfInfo> {
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+
+  const payload = {
+    filename: file.name,
+    fileSize: file.size,
+    mimeType: file.type || 'application/pdf',
+    dataUrl
+  };
+
+  const res = await fetch('/api/anuncio/pdf', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    throw new Error(errData.error || 'Error al subir el archivo PDF de Anuncios');
+  }
+
+  const result = await res.json();
+  const pdfInfo: AnuncioPdfInfo = {
+    filename: file.name,
+    fileSize: file.size,
+    mimeType: file.type || 'application/pdf',
+    uploadedAt: new Date().toISOString(),
+    url: '/api/anuncio/pdf',
+    dataUrl
+  };
+  saveAnuncioPdfToStorage(pdfInfo);
+  return pdfInfo;
+}
+
+export async function deleteAnuncioPdf(): Promise<boolean> {
+  try {
+    saveAnuncioPdfToStorage(null);
+    const res = await fetch('/api/anuncio/pdf', { method: 'DELETE' });
+    return res.ok;
+  } catch (e) {
+    console.warn('Error deleting Anuncio PDF:', e);
+    return false;
+  }
 }
