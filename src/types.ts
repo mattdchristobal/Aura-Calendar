@@ -84,6 +84,7 @@ export interface Category {
   dotClass: string;
   badgeClass: string;
   description?: string;
+  includeInPublicPdf?: boolean; // Controls whether this category and its events appear in the public PDF / QR schedule (defaults to true)
 }
 
 export interface CalendarEvent {
@@ -96,6 +97,8 @@ export interface CalendarEvent {
   startTime: string; // HH:mm (24h)
   endTime: string; // HH:mm (24h)
   categoryId: string;
+  categoryName?: string;
+  categoryHex?: string;
   tags?: string[]; // Event tags e.g. ["Urgent", "Meeting", "Catechesis"]
   tema?: string; // e.g. "Tema 1", "Tema 2", "Tema 3" or custom admin temas
   temas?: string[]; // Multiple assigned temas e.g. ["Tema 1", "Tema 2"]

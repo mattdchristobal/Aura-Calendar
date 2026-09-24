@@ -107,14 +107,45 @@ export function generateStandaloneScheduleHtml(options: GenerateOptions): string
   const primaryHex = category.hex || '#4f46e5';
 
   // Filter events for this category (or all if master overview)
-  const isAll = category.id === 'all' || category.id === 'overview';
-  const categoryEvents = isAll
-    ? events
-    : events.filter(
-        (e) =>
-          e.categoryId === category.id ||
-          (category.name && e.categoryId && e.categoryId.toLowerCase() === category.name.toLowerCase())
-      );
+  const isAll = category.id === 'all' || category.id === 'overview' || category.id === 'sacramentos';
+  const excludedCatIds = new Set(
+    (allCategories || [])
+      .filter((c) => c && (c.includeInPublicPdf === false || (c as any).includeInPublicPdf === 'false'))
+      .map((c) => (c.id || '').toLowerCase())
+  );
+  const excludedCatNames = new Set(
+    (allCategories || [])
+      .filter((c) => c && (c.includeInPublicPdf === false || (c as any).includeInPublicPdf === 'false'))
+      .map((c) => (c.name || '').toLowerCase())
+  );
+
+  const isCurrentCatExcluded = !isAll && (
+    category.includeInPublicPdf === false ||
+    (category as any).includeInPublicPdf === 'false' ||
+    excludedCatIds.has((category.id || '').toLowerCase()) ||
+    excludedCatNames.has((category.name || '').toLowerCase())
+  );
+
+  const categoryEvents = isCurrentCatExcluded
+    ? []
+    : (isAll
+        ? events.filter((e) => {
+            const catKey = (e.categoryId || '').toLowerCase();
+            const catNameKey = (e.categoryName || '').toLowerCase();
+            return !excludedCatIds.has(catKey) && !excludedCatNames.has(catKey) && !excludedCatNames.has(catNameKey);
+          })
+        : events.filter((e) => {
+            const catKey = (e.categoryId || '').toLowerCase();
+            const catNameKey = (e.categoryName || '').toLowerCase();
+            if (excludedCatIds.has(catKey) || excludedCatNames.has(catKey) || excludedCatNames.has(catNameKey)) {
+              return false;
+            }
+            return (
+              e.categoryId === category.id ||
+              (category.id && catKey === category.id.toLowerCase()) ||
+              (category.name && (catKey === category.name.toLowerCase() || catNameKey === category.name.toLowerCase()))
+            );
+          }));
 
   // Determine all months represented in the events + 12 months back and 24 months forward
   const now = new Date();

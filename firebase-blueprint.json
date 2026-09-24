@@ -75,6 +75,9 @@
         },
         "hex": {
           "type": "string"
+        },
+        "includeInPublicPdf": {
+          "type": "boolean"
         }
       },
       "required": ["id", "name"]

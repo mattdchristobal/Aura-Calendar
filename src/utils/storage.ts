@@ -1204,19 +1204,9 @@ export function loadCategories(): Category[] {
 }
 
 export function saveCategories(categories: Category[]): void {
-  const validCategories = (categories || []).filter((c) => c && c.id);
+  const deletedSet = loadDeletedCategoryIds();
+  const validCategories = (categories || []).filter((c) => c && c.id && !deletedSet.has(c.id));
   try {
-    const deletedSet = loadDeletedCategoryIds();
-    let changed = false;
-    validCategories.forEach((c) => {
-      if (deletedSet.has(c.id)) {
-        deletedSet.delete(c.id);
-        changed = true;
-      }
-    });
-    if (changed) {
-      localStorage.setItem(KEYS.DELETED_CATEGORY_IDS, JSON.stringify(Array.from(deletedSet)));
-    }
     localStorage.setItem(KEYS.CATEGORIES, JSON.stringify(validCategories));
     localStorage.setItem(KEYS.PERMANENT_CATEGORIES_VAULT, JSON.stringify(validCategories));
   } catch (e) {

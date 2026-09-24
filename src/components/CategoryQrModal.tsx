@@ -18,7 +18,8 @@ import {
   HardDrive,
   RefreshCw,
   Link2,
-  FileSpreadsheet
+  FileSpreadsheet,
+  AlertCircle
 } from 'lucide-react';
 import { Category, CalendarEvent, User, UserSettings } from '../types';
 import {
@@ -369,14 +370,24 @@ export const CategoryQrModal: React.FC<CategoryQrModalProps> = ({
                   <optgroup label="Categorías Individuales">
                     {categories.map((cat) => {
                       const count = events.filter((e) => e.categoryId === cat.id).length;
+                      const isPublic = cat.includeInPublicPdf !== false;
                       return (
                         <option key={cat.id} value={cat.id}>
-                          {cat.name} ({count} event{count === 1 ? '' : 's'})
+                          {cat.name} ({count} event{count === 1 ? '' : 's'}){!isPublic ? ' 🔒 [Oculto en PDF]' : ''}
                         </option>
                       );
                     })}
                   </optgroup>
                 </select>
+
+                {activeCategory && activeCategory.includeInPublicPdf === false && (
+                  <div className="mt-2.5 p-3 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900/60 flex items-start gap-2.5 text-xs text-amber-900 dark:text-amber-200">
+                    <AlertCircle className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                    <span>
+                      <strong>Categoría Privada:</strong> Esta categoría está configurada como excluida del PDF público general y del código QR maestro. Puedes cambiar esta opción en <em>Configuración &gt; Categorías</em>.
+                    </span>
+                  </div>
+                )}
 
                 {selectedCategoryId === 'all' && (
                   <div className="mt-2.5 p-3 rounded-xl bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-200 dark:border-indigo-900/60 flex items-start gap-2.5 text-xs text-indigo-900 dark:text-indigo-200">

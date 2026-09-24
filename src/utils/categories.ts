@@ -138,7 +138,8 @@ export function createCategory(
   name: string,
   colorKey: string,
   id?: string,
-  customHex?: string
+  customHex?: string,
+  includeInPublicPdf: boolean = true
 ): Category {
   const cleanId = id || name.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || `cat_${Date.now()}`;
   const preset = CATEGORY_COLOR_PRESETS.find((p) => p.key === colorKey) || CATEGORY_COLOR_PRESETS[0];
@@ -152,7 +153,8 @@ export function createCategory(
     textClass: preset.textClass,
     borderClass: preset.borderClass,
     dotClass: preset.dotClass,
-    badgeClass: preset.badgeClass
+    badgeClass: preset.badgeClass,
+    includeInPublicPdf: includeInPublicPdf !== false
   };
 }
 

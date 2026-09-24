@@ -257,29 +257,80 @@ export const CategoryPdfDocumentView: React.FC<CategoryPdfDocumentViewProps> = (
 
   // Filter events belonging to this category (or all categories if isAll)
   const categoryEvents = useMemo(() => {
+    const excludedCatIds = new Set(
+      effectiveCategories
+        .filter((c) => c && (c.includeInPublicPdf === false || (c as any).includeInPublicPdf === 'false'))
+        .map((c) => (c.id || '').toLowerCase())
+    );
+    const excludedCatNames = new Set(
+      effectiveCategories
+        .filter((c) => c && (c.includeInPublicPdf === false || (c as any).includeInPublicPdf === 'false'))
+        .map((c) => (c.name || '').toLowerCase())
+    );
+
+    // If viewing a category with public PDF disabled, return zero events
+    if (!isAll) {
+      const isTargetCatExcluded =
+        effectiveCategory.includeInPublicPdf === false ||
+        (effectiveCategory as any).includeInPublicPdf === 'false' ||
+        excludedCatIds.has((effectiveCategory.id || '').toLowerCase()) ||
+        excludedCatNames.has((effectiveCategory.name || '').toLowerCase());
+      if (isTargetCatExcluded) {
+        return [];
+      }
+    }
+
     if (isAll) {
       if (selectedCategoryFilter !== 'all') {
-        return liveEvents.filter((e) =>
-          e.categoryId === selectedCategoryFilter ||
-          (e.categoryId && e.categoryId.toLowerCase() === selectedCategoryFilter.toLowerCase())
-        );
+        const filterLower = selectedCategoryFilter.toLowerCase();
+        if (excludedCatIds.has(filterLower) || excludedCatNames.has(filterLower)) {
+          return [];
+        }
+        return liveEvents.filter((e) => {
+          const catKey = (e.categoryId || '').toLowerCase();
+          const catNameKey = (e.categoryName || '').toLowerCase();
+          if (excludedCatIds.has(catKey) || excludedCatNames.has(catKey) || excludedCatNames.has(catNameKey)) {
+            return false;
+          }
+          return (
+            e.categoryId === selectedCategoryFilter ||
+            catKey === filterLower
+          );
+        });
       }
-      return liveEvents;
+      return liveEvents.filter((e) => {
+        const catKey = (e.categoryId || '').toLowerCase();
+        const catNameKey = (e.categoryName || '').toLowerCase();
+        return !excludedCatIds.has(catKey) && !excludedCatNames.has(catKey) && !excludedCatNames.has(catNameKey);
+      });
     }
-    const filtered = liveEvents.filter((e) =>
-      e.categoryId === effectiveCategory.id ||
-      (e.categoryId && effectiveCategory.id && e.categoryId.toLowerCase() === effectiveCategory.id.toLowerCase()) ||
-      (e.categoryId && effectiveCategory.name && e.categoryId.toLowerCase() === effectiveCategory.name.toLowerCase())
-    );
+
+    const filtered = liveEvents.filter((e) => {
+      const catKey = (e.categoryId || '').toLowerCase();
+      const catNameKey = (e.categoryName || '').toLowerCase();
+      if (excludedCatIds.has(catKey) || excludedCatNames.has(catKey) || excludedCatNames.has(catNameKey)) {
+        return false;
+      }
+      return (
+        e.categoryId === effectiveCategory.id ||
+        (effectiveCategory.id && catKey === effectiveCategory.id.toLowerCase()) ||
+        (effectiveCategory.name && (catKey === effectiveCategory.name.toLowerCase() || catNameKey === effectiveCategory.name.toLowerCase()))
+      );
+    });
+
     // If no events matched category directly, but liveEvents has events:
-    // If category is default/new or only 1 category exists, fall back to all live events
+    // If category is default/new or only 1 category exists, fall back to public live events
     if (filtered.length === 0 && liveEvents.length > 0) {
       if (effectiveCategories.length <= 1 || effectiveCategory.id.toLowerCase() === 'new' || effectiveCategory.id.toLowerCase() === 'default') {
-        return liveEvents;
+        return liveEvents.filter((e) => {
+          const catKey = (e.categoryId || '').toLowerCase();
+          const catNameKey = (e.categoryName || '').toLowerCase();
+          return !excludedCatIds.has(catKey) && !excludedCatNames.has(catKey) && !excludedCatNames.has(catNameKey);
+        });
       }
     }
     return filtered;
-  }, [liveEvents, effectiveCategory.id, effectiveCategory.name, isAll, selectedCategoryFilter, effectiveCategories.length]);
+  }, [liveEvents, effectiveCategory.id, effectiveCategory.name, effectiveCategory.includeInPublicPdf, isAll, selectedCategoryFilter, effectiveCategories]);
 
   const todayStr = toYMD(new Date());
   const currentMonthStr = todayStr.slice(0, 7); // e.g. "2026-09"
@@ -704,6 +755,15 @@ export const CategoryPdfDocumentView: React.FC<CategoryPdfDocumentViewProps> = (
             </h1>
           </div>
 
+          {!isAll && (effectiveCategory.includeInPublicPdf === false || (effectiveCategory as any).includeInPublicPdf === 'false') && (
+            <div className="mb-4 p-4 rounded-2xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-200 flex items-center gap-3">
+              <span className="text-lg">🔒</span>
+              <div className="text-xs sm:text-sm">
+                <span className="font-bold">Categoría Privada:</span> Esta categoría tiene deshabilitada la opción para el PDF público. Sus eventos no se muestran en el documento público ni al escanear el código QR.
+              </div>
+            </div>
+          )}
+
           {/* Collapsible Public Share & Link Details */}
           <details className="mb-4 p-3 rounded-2xl bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-700/80 print:hidden group">
             <summary className="flex items-center justify-between text-xs font-bold text-slate-700 dark:text-slate-300 cursor-pointer select-none">
@@ -789,6 +849,9 @@ export const CategoryPdfDocumentView: React.FC<CategoryPdfDocumentViewProps> = (
                     <span>All (/pdf/all)</span>
                   </button>
                   {effectiveCategories.map((cat) => {
+                    if (cat.includeInPublicPdf === false || (cat as any).includeInPublicPdf === 'false') {
+                      return null;
+                    }
                     const isSelected = effectiveCategory.id === cat.id;
                     return (
                       <button

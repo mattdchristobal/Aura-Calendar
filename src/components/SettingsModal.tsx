@@ -51,7 +51,10 @@ import {
   HelpCircle,
   Info,
   ChevronRight,
-  Cloud
+  Cloud,
+  FileText,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 
 interface SettingsModalProps {
@@ -171,10 +174,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [newCatName, setNewCatName] = useState('');
   const [newCatColorKey, setNewCatColorKey] = useState('indigo');
   const [newCatCustomHex, setNewCatCustomHex] = useState('');
+  const [newCatIncludeInPublicPdf, setNewCatIncludeInPublicPdf] = useState(true);
   const [editingCatId, setEditingCatId] = useState<string | null>(null);
   const [editCatName, setEditCatName] = useState('');
   const [editCatColorKey, setEditCatColorKey] = useState('blue');
   const [editCatCustomHex, setEditCatCustomHex] = useState('');
+  const [editCatIncludeInPublicPdf, setEditCatIncludeInPublicPdf] = useState(true);
   const [deletingCatId, setDeletingCatId] = useState<string | null>(null);
   const [categorySuccessToast, setCategorySuccessToast] = useState('');
   const [categoryErrorMsg, setCategoryErrorMsg] = useState('');
@@ -200,12 +205,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       return;
     }
 
-    const cat = createCategory(trimmed, newCatColorKey, undefined, newCatCustomHex || undefined);
+    const cat = createCategory(trimmed, newCatColorKey, undefined, newCatCustomHex || undefined, newCatIncludeInPublicPdf);
     if (onSaveCategory) {
       onSaveCategory(cat);
       setCategorySuccessToast(`Created category tag "${cat.name}" successfully!`);
       setNewCatName('');
       setNewCatCustomHex('');
+      setNewCatIncludeInPublicPdf(true);
     }
   };
 
@@ -215,6 +221,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setEditCatName(cat.name);
     setEditCatColorKey(cat.color || 'blue');
     setEditCatCustomHex(cat.hex || '');
+    setEditCatIncludeInPublicPdf(cat.includeInPublicPdf !== false);
     setCategoryErrorMsg('');
   };
 
@@ -227,12 +234,33 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       return;
     }
 
-    const updated = createCategory(editCatName.trim(), editCatColorKey, editingCatId, editCatCustomHex || undefined);
+    const updated = createCategory(
+      editCatName.trim(),
+      editCatColorKey,
+      editingCatId,
+      editCatCustomHex || undefined,
+      editCatIncludeInPublicPdf
+    );
     if (onSaveCategory) {
       onSaveCategory(updated);
       setCategorySuccessToast(`Updated category tag "${updated.name}" successfully!`);
       setEditingCatId(null);
     }
+  };
+
+  const handleToggleCategoryPublicPdf = (cat: Category) => {
+    if (!canEditCategories || !onSaveCategory) return;
+    const currentVal = cat.includeInPublicPdf !== false;
+    const updated: Category = {
+      ...cat,
+      includeInPublicPdf: !currentVal
+    };
+    onSaveCategory(updated);
+    setCategorySuccessToast(
+      !currentVal
+        ? `Category "${cat.name}" is now included in the public PDF!`
+        : `Category "${cat.name}" is now hidden from the public PDF.`
+    );
   };
 
   const handleConfirmDeleteCategory = () => {
@@ -2290,6 +2318,37 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </div>
                   </div>
 
+                  {/* Public PDF Visibility Toggle */}
+                  <div className="p-3 sm:p-4 rounded-2xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-between gap-3 shadow-2xs">
+                    <div className="flex items-center gap-2.5">
+                      <div className={`p-2 rounded-xl shrink-0 ${editCatIncludeInPublicPdf ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/80 dark:text-emerald-300' : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'}`}>
+                        {editCatIncludeInPublicPdf ? <FileText className="w-4 h-4" /> : <Lock className="w-4 h-4" />}
+                      </div>
+                      <div>
+                        <div className="text-xs font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
+                          <span>Public PDF &amp; QR Schedule Visibility</span>
+                          <span className={`text-[10px] font-extrabold uppercase px-1.5 py-0.5 rounded ${editCatIncludeInPublicPdf ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-300' : 'bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-300'}`}>
+                            {editCatIncludeInPublicPdf ? 'Included in PDF' : 'Hidden from PDF'}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          {editCatIncludeInPublicPdf
+                            ? 'Events with this tag will be visible in the public PDF document and QR schedule.'
+                            : 'This tag will be excluded from the public PDF document and QR schedule.'}
+                        </p>
+                      </div>
+                    </div>
+                    <label className="relative inline-flex items-center cursor-pointer shrink-0">
+                      <input
+                        type="checkbox"
+                        checked={editCatIncludeInPublicPdf}
+                        onChange={(e) => setEditCatIncludeInPublicPdf(e.target.checked)}
+                        className="sr-only peer"
+                      />
+                      <div className="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer dark:bg-slate-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-600 peer-checked:bg-emerald-600"></div>
+                    </label>
+                  </div>
+
                   {/* Edit Live Preview Pill */}
                   <div className="p-3 rounded-2xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-between">
                     <div className="flex items-center gap-2">
@@ -2440,6 +2499,37 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </div>
                   </div>
 
+                  {/* Public PDF Visibility Toggle */}
+                  <div className="p-3.5 rounded-2xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-between gap-3 shadow-2xs">
+                    <div className="flex items-center gap-2.5">
+                      <div className={`p-2 rounded-xl shrink-0 ${newCatIncludeInPublicPdf ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/80 dark:text-emerald-300' : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'}`}>
+                        {newCatIncludeInPublicPdf ? <FileText className="w-4 h-4" /> : <Lock className="w-4 h-4" />}
+                      </div>
+                      <div>
+                        <div className="text-xs font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
+                          <span>Public PDF &amp; QR Schedule Visibility</span>
+                          <span className={`text-[10px] font-extrabold uppercase px-1.5 py-0.5 rounded ${newCatIncludeInPublicPdf ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-300' : 'bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-300'}`}>
+                            {newCatIncludeInPublicPdf ? 'Enabled for PDF' : 'Hidden from PDF'}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          {newCatIncludeInPublicPdf
+                            ? 'Events with this tag will appear on the public PDF document and QR schedule.'
+                            : 'This tag will be excluded from the public PDF document and QR schedule (internal/private).'}
+                        </p>
+                      </div>
+                    </div>
+                    <label className="relative inline-flex items-center cursor-pointer shrink-0">
+                      <input
+                        type="checkbox"
+                        checked={newCatIncludeInPublicPdf}
+                        onChange={(e) => setNewCatIncludeInPublicPdf(e.target.checked)}
+                        className="sr-only peer"
+                      />
+                      <div className="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer dark:bg-slate-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-slate-600 peer-checked:bg-emerald-600"></div>
+                    </label>
+                  </div>
+
                   {/* Live Preview & Submit Row */}
                   <div className="pt-2 border-t border-slate-200/80 dark:border-slate-700/80 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
                     <div className="flex items-center gap-2">
@@ -2558,16 +2648,34 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                                   {cat.id}
                                 </span>
                               </div>
-                              <div className="text-[11px] text-slate-500 flex items-center gap-2 mt-0.5">
+                              <div className="text-[11px] text-slate-500 flex items-center gap-2 mt-0.5 flex-wrap">
                                 <span className="font-mono">{cat.hex || '#3B82F6'}</span>
                                 <span>&bull;</span>
                                 <span>{usageCount} event{usageCount !== 1 ? 's' : ''}</span>
+                                <span>&bull;</span>
+                                <span className={`inline-flex items-center gap-1 font-semibold ${cat.includeInPublicPdf !== false ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'}`}>
+                                  {cat.includeInPublicPdf !== false ? <FileText className="w-3 h-3" /> : <Lock className="w-3 h-3" />}
+                                  <span>{cat.includeInPublicPdf !== false ? 'Public PDF: ON' : 'Public PDF: OFF'}</span>
+                                </span>
                               </div>
                             </div>
                           </div>
 
                           {canEditCategories && (
                             <div className="flex items-center gap-1.5 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => handleToggleCategoryPublicPdf(cat)}
+                                className={`p-1.5 rounded-xl transition-colors cursor-pointer ${
+                                  cat.includeInPublicPdf !== false
+                                    ? 'text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-950/60'
+                                    : 'text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700 hover:text-slate-600'
+                                }`}
+                                title={cat.includeInPublicPdf !== false ? 'Included in Public PDF (Click to disable)' : 'Hidden from Public PDF (Click to enable)'}
+                              >
+                                {cat.includeInPublicPdf !== false ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+                              </button>
+
                               <button
                                 type="button"
                                 onClick={() => handleStartEditCategory(cat)}

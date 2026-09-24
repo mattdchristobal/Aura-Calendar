@@ -47,6 +47,8 @@ interface CalendarEvent {
   startTime: string;
   endTime: string;
   categoryId: string;
+  categoryName?: string;
+  categoryHex?: string;
   tags?: string[];
   tema?: string;
   temas?: string[];
@@ -106,6 +108,8 @@ interface Category {
   borderClass: string;
   dotClass: string;
   badgeClass: string;
+  description?: string;
+  includeInPublicPdf?: boolean;
 }
 
 interface SharedCalendar {
@@ -928,10 +932,21 @@ async function saveDbToFirestore(dbData: DatabaseSchema): Promise<void> {
       }
     }
 
+    // 2b. Clean up deleted categories from Firestore
+    if (Array.isArray(dbData.deletedCategoryIds)) {
+      const activeCatIds = new Set((dbData.categories || []).map(c => c.id));
+      for (const delCatId of dbData.deletedCategoryIds) {
+        if (delCatId && typeof delCatId === 'string' && !activeCatIds.has(delCatId)) {
+          await firestoreDeleteDoc(firestoreDoc(fDb, 'categories', delCatId)).catch(() => {});
+        }
+      }
+    }
+
     // 3. Persist categories
     if (Array.isArray(dbData.categories)) {
+      const delCatSet = new Set(dbData.deletedCategoryIds || []);
       for (const cat of dbData.categories) {
-        if (cat && cat.id) {
+        if (cat && cat.id && !delCatSet.has(cat.id)) {
           await firestoreSetDoc(firestoreDoc(fDb, 'categories', cat.id), cat, { merge: true });
         }
       }
@@ -988,14 +1003,39 @@ async function syncDbFromFirestore(targetDb: DatabaseSchema): Promise<boolean> {
     const catSnap = await firestoreGetDocs(firestoreCol(fDb, 'categories'));
     if (!catSnap.empty) {
       const cloudCats: Category[] = [];
+      const delCatSet = new Set(targetDb.deletedCategoryIds || []);
       catSnap.forEach((d) => {
         const cat = d.data() as Category;
-        if (cat && cat.id) cloudCats.push(cat);
+        if (cat && cat.id) {
+          if (delCatSet.has(cat.id)) {
+            // Permanently remove tombstoned category from Firestore
+            firestoreDeleteDoc(firestoreDoc(fDb, 'categories', cat.id)).catch(() => {});
+          } else {
+            cloudCats.push(cat);
+          }
+        }
       });
       if (cloudCats.length > 0) {
-        const catMap = new Map<string, Category>((targetDb.categories || []).map(c => [c.id, c]));
-        cloudCats.forEach(c => catMap.set(c.id, c));
-        const newCats = Array.from(catMap.values());
+        const catMap = new Map<string, Category>(
+          (targetDb.categories || []).filter(c => c && c.id && !delCatSet.has(c.id)).map(c => [c.id, c])
+        );
+        cloudCats.forEach(c => {
+          if (!delCatSet.has(c.id)) {
+            const existing = catMap.get(c.id);
+            if (existing) {
+              catMap.set(c.id, {
+                ...existing,
+                ...c,
+                includeInPublicPdf: typeof c.includeInPublicPdf === 'boolean'
+                  ? c.includeInPublicPdf
+                  : (typeof existing.includeInPublicPdf === 'boolean' ? existing.includeInPublicPdf : true)
+              });
+            } else {
+              catMap.set(c.id, c);
+            }
+          }
+        });
+        const newCats = Array.from(catMap.values()).filter(c => c && c.id && !delCatSet.has(c.id));
         if (JSON.stringify(targetDb.categories) !== JSON.stringify(newCats)) {
           targetDb.categories = newCats;
           changed = true;
@@ -1135,20 +1175,18 @@ async function startServer() {
     );
     const currentDeletedSet = new Set(db.deletedEventIds);
 
-    // Merge incoming deletedCategoryIds (strictly excluding any categories being actively saved or present in db.categories)
-    const activeServerCategoryIds = new Set((db.categories || []).map((c: any) => c.id).filter(Boolean));
-    const incomingCatIds = new Set((incomingCategories || []).map((c: any) => c.id).filter(Boolean));
-    const allActiveCategoryIds = new Set([...activeServerCategoryIds, ...incomingCatIds]);
-
-    if (db.deletedCategoryIds && db.deletedCategoryIds.length > 0) {
-      db.deletedCategoryIds = db.deletedCategoryIds.filter((id) => !allActiveCategoryIds.has(id));
-    }
+    // Merge incoming deletedCategoryIds
+    if (!db.deletedCategoryIds) db.deletedCategoryIds = [];
     if (Array.isArray(incomingDeletedCategoryIds) && incomingDeletedCategoryIds.length > 0) {
-      const validDeleted = incomingDeletedCategoryIds.filter((id) => !allActiveCategoryIds.has(id));
-      const delCatSet = new Set([...db.deletedCategoryIds, ...validDeleted]);
+      const delCatSet = new Set([...db.deletedCategoryIds, ...incomingDeletedCategoryIds.filter(Boolean)]);
       db.deletedCategoryIds = Array.from(delCatSet);
     }
     const currentDeletedCatSet = new Set(db.deletedCategoryIds);
+
+    // Purge deleted categories from db.categories immediately
+    if (db.categories) {
+      db.categories = db.categories.filter((c: Category) => c && c.id && !currentDeletedCatSet.has(c.id));
+    }
 
     // Merge incoming deletedUserIds
     if (Array.isArray(incomingDeletedUserIds) && incomingDeletedUserIds.length > 0) {
@@ -1205,13 +1243,9 @@ async function startServer() {
 
     if (Array.isArray(incomingCategories)) {
       const catMap = new Map<string, Category>();
-      (db.categories || []).forEach((c) => { if (c && c.id && !currentDeletedCatSet.has(c.id)) catMap.set(c.id, c); });
       incomingCategories.forEach((c: Category) => {
-        if (c && c.id) {
+        if (c && c.id && !currentDeletedCatSet.has(c.id)) {
           catMap.set(c.id, c);
-          if (db.deletedCategoryIds) {
-            db.deletedCategoryIds = db.deletedCategoryIds.filter((id) => id !== c.id);
-          }
         }
       });
       db.categories = Array.from(catMap.values());
@@ -1219,29 +1253,15 @@ async function startServer() {
       db.categories = db.categories.filter((c: Category) => c && c.id && !currentDeletedCatSet.has(c.id));
     }
 
-    // STRICT PERSISTENCE: Ensure every event category exists in db.categories and is never treated as deleted
-    const activeCatMap = new Map<string, Category>((db.categories || []).map(c => [c.id, c]));
+    // Reassign any events referencing deleted categories to fallback category.
+    // NEVER resurrect a deleted category!
+    const fallbackCatId = (db.categories && db.categories[0]?.id) || 'work';
     (db.events || []).forEach((e) => {
-      if (e && e.categoryId && !activeCatMap.has(e.categoryId)) {
-        const seed = SEED_CATEGORIES.find(c => c.id === e.categoryId);
-        const resolved: Category = seed || {
-          id: e.categoryId,
-          name: e.categoryId.charAt(0).toUpperCase() + e.categoryId.slice(1),
-          color: 'indigo',
-          hex: '#6366F1',
-          bgClass: 'bg-indigo-50 dark:bg-indigo-950/40',
-          borderClass: 'border-indigo-200 dark:border-indigo-800',
-          textClass: 'text-indigo-700 dark:text-indigo-300',
-          badgeClass: 'bg-indigo-100 dark:bg-indigo-900 text-indigo-800 dark:text-indigo-200',
-          dotClass: 'bg-indigo-500'
-        };
-        activeCatMap.set(e.categoryId, resolved);
-        if (db.deletedCategoryIds) {
-          db.deletedCategoryIds = db.deletedCategoryIds.filter(id => id !== e.categoryId);
-        }
+      if (e && e.categoryId && currentDeletedCatSet.has(e.categoryId)) {
+        e.categoryId = fallbackCatId;
+        e.updatedAt = new Date().toISOString();
       }
     });
-    db.categories = Array.from(activeCatMap.values());
 
     if (Array.isArray(incomingShares)) {
       const shareMap = new Map<string, SharedCalendar>();
@@ -2079,19 +2099,39 @@ async function startServer() {
     res.json((db.categories || SEED_CATEGORIES).filter(c => c && c.id && !delSet.has(c.id)));
   });
 
-  app.post("/api/categories", (req, res) => {
+  app.post("/api/categories", async (req, res) => {
     const payload = req.body;
-    const delSet = new Set(db.deletedCategoryIds || []);
     if (Array.isArray(payload)) {
-      const incomingIds = new Set(payload.map((c: any) => c.id).filter(Boolean));
-      if (db.deletedCategoryIds) {
-        db.deletedCategoryIds = db.deletedCategoryIds.filter(id => !incomingIds.has(id));
-      }
-      const catMap = new Map<string, Category>();
-      (db.categories || []).forEach((c) => { if (c && c.id && !db.deletedCategoryIds?.includes(c.id)) catMap.set(c.id, c); });
-      payload.forEach((c: Category) => { if (c && c.id) catMap.set(c.id, c); });
-      db.categories = Array.from(catMap.values());
+      const validPayload = payload.filter((c: any) => c && c.id);
+      const incomingIds = new Set(validPayload.map((c: any) => c.id));
+      if (!db.deletedCategoryIds) db.deletedCategoryIds = [];
+
+      // Record any previously existing category not present in incoming list as deleted
+      const fDb = getCloudFirestore();
+      (db.categories || []).forEach((oldCat) => {
+        if (oldCat && oldCat.id && !incomingIds.has(oldCat.id)) {
+          if (!db.deletedCategoryIds.includes(oldCat.id)) {
+            db.deletedCategoryIds.push(oldCat.id);
+          }
+          if (fDb) {
+            firestoreDeleteDoc(firestoreDoc(fDb, 'categories', oldCat.id)).catch(() => {});
+          }
+        }
+      });
+
+      // Clear deleted status for active incoming categories
+      db.deletedCategoryIds = db.deletedCategoryIds.filter(id => !incomingIds.has(id));
+      db.categories = validPayload;
       saveDb(db);
+      try {
+        if (fDb) {
+          for (const c of db.categories) {
+            if (c && c.id) {
+              await firestoreSetDoc(firestoreDoc(fDb, 'categories', c.id), c, { merge: true }).catch(() => {});
+            }
+          }
+        }
+      } catch (e) {}
       return res.status(201).json(db.categories);
     }
     const newCat = payload as Category;
@@ -2109,10 +2149,16 @@ async function startServer() {
       db.categories.push(newCat);
     }
     saveDb(db);
+    try {
+      const fDb = getCloudFirestore();
+      if (fDb) {
+        await firestoreSetDoc(firestoreDoc(fDb, 'categories', newCat.id), newCat, { merge: true }).catch(() => {});
+      }
+    } catch (e) {}
     res.status(201).json(newCat);
   });
 
-  app.put("/api/categories/:id", (req, res) => {
+  app.put("/api/categories/:id", async (req, res) => {
     const catId = req.params.id;
     const updates = req.body as Category;
     if (db.deletedCategoryIds) {
@@ -2120,26 +2166,64 @@ async function startServer() {
     }
     if (!db.categories) db.categories = [...SEED_CATEGORIES];
     const idx = db.categories.findIndex((c) => c.id === catId);
+    let savedCat: Category;
     if (idx === -1) {
-      const newCat = { ...updates, id: catId };
-      db.categories.push(newCat);
-      saveDb(db);
-      return res.json(newCat);
+      savedCat = { ...updates, id: catId };
+      db.categories.push(savedCat);
+    } else {
+      savedCat = { ...db.categories[idx], ...updates, id: catId };
+      db.categories[idx] = savedCat;
     }
-    db.categories[idx] = { ...db.categories[idx], ...updates, id: catId };
     saveDb(db);
-    res.json(db.categories[idx]);
+    try {
+      const fDb = getCloudFirestore();
+      if (fDb) {
+        await firestoreSetDoc(firestoreDoc(fDb, 'categories', catId), savedCat, { merge: true }).catch(() => {});
+      }
+    } catch (e) {}
+    res.json(savedCat);
   });
 
-  app.delete("/api/categories/:id", (req, res) => {
+  app.delete("/api/categories/:id", async (req, res) => {
     const catId = req.params.id;
     if (!db.deletedCategoryIds) db.deletedCategoryIds = [];
     if (!db.deletedCategoryIds.includes(catId)) {
       db.deletedCategoryIds.push(catId);
     }
     if (!db.categories) db.categories = [...SEED_CATEGORIES];
-    db.categories = db.categories.filter((c) => c.id !== catId);
+    db.categories = db.categories.filter((c) => c && c.id !== catId);
+
+    // Reassign any events referencing the deleted category to fallback category
+    const fallbackCatId = (db.categories && db.categories[0]?.id) || 'work';
+    const updatedEvents: CalendarEvent[] = [];
+    if (db.events) {
+      db.events = db.events.map((evt) => {
+        if (evt && evt.categoryId === catId) {
+          const updated = { ...evt, categoryId: fallbackCatId, updatedAt: new Date().toISOString() };
+          updatedEvents.push(updated);
+          return updated;
+        }
+        return evt;
+      });
+    }
+
     saveDb(db);
+
+    try {
+      const fDb = getCloudFirestore();
+      if (fDb) {
+        await firestoreDeleteDoc(firestoreDoc(fDb, 'categories', catId)).catch(() => {});
+        for (const uEvt of updatedEvents) {
+          if (uEvt && uEvt.id) {
+            await firestoreSetDoc(firestoreDoc(fDb, 'events', uEvt.id), {
+              ...uEvt,
+              cloudSyncedAt: new Date().toISOString()
+            }, { merge: true }).catch(() => {});
+          }
+        }
+      }
+    } catch (e) {}
+
     res.json({ success: true, deletedId: catId, remainingCount: db.categories.length });
   });
 
@@ -2683,13 +2767,42 @@ async function startServer() {
       } catch (e) {}
     }
 
-    const matchingEvents = isAll
-      ? allEvents
-      : allEvents.filter(
-          (e) =>
-            e.categoryId === category.id ||
-            (e.categoryId && e.categoryId.toLowerCase() === category.id.toLowerCase())
-        );
+    const excludedCatIds = new Set<string>();
+    const excludedCatNames = new Set<string>();
+    categories.forEach((c: any) => {
+      if (c && (c.includeInPublicPdf === false || String(c.includeInPublicPdf) === 'false')) {
+        if (c.id) excludedCatIds.add(String(c.id).toLowerCase());
+        if (c.name) excludedCatNames.add(String(c.name).toLowerCase());
+      }
+    });
+
+    const isCurrentCatExcluded = !isAll && (
+      (category as any).includeInPublicPdf === false ||
+      String((category as any).includeInPublicPdf) === 'false' ||
+      excludedCatIds.has(String(category.id || '').toLowerCase()) ||
+      excludedCatNames.has(String(category.name || '').toLowerCase())
+    );
+
+    const matchingEvents = isCurrentCatExcluded
+      ? []
+      : (isAll
+          ? allEvents.filter((e) => {
+              const eCat = String(e.categoryId || '').toLowerCase();
+              const eName = String(e.categoryName || '').toLowerCase();
+              return !excludedCatIds.has(eCat) && !excludedCatNames.has(eCat) && !excludedCatNames.has(eName);
+            })
+          : allEvents.filter((e) => {
+              const eCat = String(e.categoryId || '').toLowerCase();
+              const eName = String(e.categoryName || '').toLowerCase();
+              if (excludedCatIds.has(eCat) || excludedCatNames.has(eCat) || excludedCatNames.has(eName)) {
+                return false;
+              }
+              return (
+                e.categoryId === category.id ||
+                (category.id && eCat === String(category.id).toLowerCase()) ||
+                (category.name && (eCat === String(category.name).toLowerCase() || eName === String(category.name).toLowerCase()))
+              );
+            }));
 
     return res.json({
       success: true,
@@ -2714,9 +2827,38 @@ async function startServer() {
 
     const catName = category ? category.name : 'Church Schedule';
     const allEvents = currentDb.events || [];
-    const matchingEvents = isAll
-      ? allEvents
-      : allEvents.filter((e: any) => e.categoryId === (category?.id || cleanId) || (e.categoryId && e.categoryId.toLowerCase() === (category?.id || cleanId).toLowerCase()));
+    const excludedCatIds = new Set<string>();
+    const excludedCatNames = new Set<string>();
+    categories.forEach((c: any) => {
+      if (c && (c.includeInPublicPdf === false || String(c.includeInPublicPdf) === 'false')) {
+        if (c.id) excludedCatIds.add(String(c.id).toLowerCase());
+        if (c.name) excludedCatNames.add(String(c.name).toLowerCase());
+      }
+    });
+
+    const isCurrentCatExcluded = !isAll && (
+      (category as any)?.includeInPublicPdf === false ||
+      String((category as any)?.includeInPublicPdf) === 'false' ||
+      excludedCatIds.has(cleanId.toLowerCase())
+    );
+
+    const matchingEvents = isCurrentCatExcluded
+      ? []
+      : (isAll
+          ? allEvents.filter((e: any) => {
+              const eCat = String(e.categoryId || '').toLowerCase();
+              const eName = String(e.categoryName || '').toLowerCase();
+              return !excludedCatIds.has(eCat) && !excludedCatNames.has(eCat) && !excludedCatNames.has(eName);
+            })
+          : allEvents.filter((e: any) => {
+              const eCat = String(e.categoryId || '').toLowerCase();
+              const eName = String(e.categoryName || '').toLowerCase();
+              if (excludedCatIds.has(eCat) || excludedCatNames.has(eCat) || excludedCatNames.has(eName)) {
+                return false;
+              }
+              const targetId = (category?.id || cleanId).toLowerCase();
+              return eCat === targetId || (category?.name && (eCat === category.name.toLowerCase() || eName === category.name.toLowerCase()));
+            }));
 
     const dtstamp = new Date().toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
     let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Church Ministry Schedule//ExecutiveSync//EN\r\nCALSCALE:GREGORIAN\r\nMETHOD:PUBLISH\r\nX-WR-CALNAME:" + catName.replace(/[\r\n]/g, ' ') + "\r\n";
@@ -2773,7 +2915,21 @@ async function startServer() {
     } catch (e) {}
     const deletedSet = new Set(db.deletedEventIds || []);
     const cleanEvents = deduplicateServerEvents(db.events || [], deletedSet);
-    return res.json(cleanEvents);
+    const categories = db.categories || SEED_CATEGORIES;
+    const excludedCatIds = new Set<string>();
+    const excludedCatNames = new Set<string>();
+    categories.forEach((c: any) => {
+      if (c && (c.includeInPublicPdf === false || String(c.includeInPublicPdf) === 'false')) {
+        if (c.id) excludedCatIds.add(String(c.id).toLowerCase());
+        if (c.name) excludedCatNames.add(String(c.name).toLowerCase());
+      }
+    });
+    const publicEvents = cleanEvents.filter((e) => {
+      const eCat = String(e.categoryId || '').toLowerCase();
+      const eName = String(e.categoryName || '').toLowerCase();
+      return !excludedCatIds.has(eCat) && !excludedCatNames.has(eCat) && !excludedCatNames.has(eName);
+    });
+    return res.json(publicEvents);
   });
 
   // PUBLIC: Get all categories without requiring authentication/session
@@ -3405,7 +3561,45 @@ async function startServer() {
   // PUBLIC: Direct HTML/PDF Document View for scanning QR codes (Clean document view with Event Title, Date, Time only + Next Month Navigation)
   // PUBLIC: Direct HTML/PDF Document View for scanning QR codes (Clean document view with Event Title, Date, Time only + Next Month Navigation)
   const renderCategoryPdfHtml = (category: any, events: any[], allCategories: any[], qrDataUrl?: string, requestedMonth?: string) => {
-    const cleanDeduplicated = deduplicateServerEvents(events || []);
+    const isAll = category.id === 'all' || category.id === 'overview' || category.id === 'sacramentos' || (category.name && (category.name.toLowerCase().includes('all') || category.name.toLowerCase().includes('overview') || category.name.toLowerCase().includes('sacramentos')));
+    if (isAll) {
+      category.name = 'Sacramentos';
+    }
+
+    const excludedCatIds = new Set<string>();
+    const excludedCatNames = new Set<string>();
+    (allCategories || []).forEach((c: any) => {
+      if (c && (c.includeInPublicPdf === false || String(c.includeInPublicPdf) === 'false')) {
+        if (c.id) excludedCatIds.add(String(c.id).toLowerCase());
+        if (c.name) excludedCatNames.add(String(c.name).toLowerCase());
+      }
+    });
+
+    const isCurrentCatExcluded = !isAll && (
+      category.includeInPublicPdf === false ||
+      String(category.includeInPublicPdf) === 'false' ||
+      excludedCatIds.has(String(category.id || '').toLowerCase()) ||
+      excludedCatNames.has(String(category.name || '').toLowerCase())
+    );
+
+    const filteredEvents = isCurrentCatExcluded
+      ? []
+      : (events || []).filter((e: any) => {
+          if (!e) return false;
+          const eCat = String(e.categoryId || '').toLowerCase();
+          const eName = String(e.categoryName || '').toLowerCase();
+          if (excludedCatIds.has(eCat) || excludedCatNames.has(eCat) || excludedCatNames.has(eName)) {
+            return false;
+          }
+          if (isAll) return true;
+          return (
+            e.categoryId === category.id ||
+            (category.id && eCat === String(category.id).toLowerCase()) ||
+            (category.name && (eCat === String(category.name).toLowerCase() || eName === String(category.name).toLowerCase()))
+          );
+        });
+
+    const cleanDeduplicated = deduplicateServerEvents(filteredEvents);
     const sortedEvents = [...cleanDeduplicated].sort((a, b) => {
       const aKey = (a.startDate || '') + (a.startTime || '');
       const bKey = (b.startDate || '') + (b.startTime || '');
@@ -3453,10 +3647,6 @@ async function startServer() {
       return ymStr;
     };
 
-    const isAll = category.id === 'all' || category.id === 'overview' || category.id === 'sacramentos' || (category.name && (category.name.toLowerCase().includes('all') || category.name.toLowerCase().includes('overview') || category.name.toLowerCase().includes('sacramentos')));
-    if (isAll) {
-      category.name = 'Sacramentos';
-    }
     const categoriesMap = new Map((allCategories || []).map((c: any) => [c.id, c]));
 
     // Determine initial month on server so HTML is pre-rendered immediately for any scanner or browser
@@ -3802,11 +3992,14 @@ async function startServer() {
     );
 
     const categoriesListJson = JSON.stringify(
-      (allCategories || []).map((c: any) => ({
-        id: c.id,
-        name: c.name,
-        hex: c.hex || '#6366f1'
-      }))
+      (allCategories || [])
+        .filter((c: any) => c && c.includeInPublicPdf !== false && String(c.includeInPublicPdf) !== 'false')
+        .map((c: any) => ({
+          id: c.id,
+          name: c.name,
+          hex: c.hex || '#6366f1',
+          includeInPublicPdf: true
+        }))
     );
 
     const safeCategoryName = escapeHtml((category.name || 'category').trim().replace(/[^a-zA-Z0-9_-]/g, '_'));
@@ -5488,19 +5681,43 @@ async function startServer() {
       }
 
       try {
-        const res = await fetch('/api/events?t=' + Date.now(), {
+        const res = await fetch('/api/public/events?t=' + Date.now(), {
           headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' }
         });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const freshEvents = await res.json();
         if (Array.isArray(freshEvents)) {
-          const matching = isAllMode
-            ? freshEvents
-            : freshEvents.filter(e => e && (e.categoryId === targetCategoryId || targetCategoryId === 'all'));
+          const excludedIds = new Set(
+            categoriesList
+              .filter(c => c && (c.includeInPublicPdf === false || String(c.includeInPublicPdf) === 'false'))
+              .map(c => String(c.id || '').toLowerCase())
+          );
+          const excludedNames = new Set(
+            categoriesList
+              .filter(c => c && (c.includeInPublicPdf === false || String(c.includeInPublicPdf) === 'false'))
+              .map(c => String(c.name || '').toLowerCase())
+          );
 
-          const effectiveMatching = (matching.length === 0 && freshEvents.length > 0 && (categoriesList.length <= 1 || targetCategoryId === 'new' || targetCategoryId === 'client'))
-            ? freshEvents
-            : matching;
+          const publicOnly = freshEvents.filter(e => {
+            if (!e) return false;
+            const eCat = String(e.categoryId || '').toLowerCase();
+            const eName = String(e.categoryName || '').toLowerCase();
+            return !excludedIds.has(eCat) && !excludedNames.has(eCat) && !excludedNames.has(eName);
+          });
+
+          const isTargetExcluded = !isAllMode && targetCategoryId && (excludedIds.has(targetCategoryId.toLowerCase()) || excludedNames.has(targetCategoryId.toLowerCase()));
+
+          const matching = isTargetExcluded
+            ? []
+            : (isAllMode
+                ? publicOnly
+                : publicOnly.filter(e => e && (
+                    e.categoryId === targetCategoryId ||
+                    targetCategoryId === 'all' ||
+                    (e.categoryId && e.categoryId.toLowerCase() === targetCategoryId.toLowerCase())
+                  )));
+
+          const effectiveMatching = matching;
 
           const newHash = JSON.stringify(effectiveMatching.map(e => (e.id || '') + (e.startDate || '') + (e.startTime || '') + (e.title || '') + (e.location || '') + (e.notes || '')));
 
@@ -5566,6 +5783,15 @@ async function startServer() {
 </body>
 </html>`;
   };
+
+  function escapeHtml(str: string): string {
+    return (str || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
 
   /**
    * Helper function ensuring colors used for QR code rendering have deep contrast against white
@@ -5712,11 +5938,69 @@ async function startServer() {
       }
     }
 
+    const excludedCatIds = new Set<string>();
+    const excludedCatNames = new Set<string>();
+    categories.forEach((c) => {
+      if (c && (c.includeInPublicPdf === false || String(c.includeInPublicPdf) === 'false')) {
+        if (c.id) excludedCatIds.add(String(c.id).toLowerCase());
+        if (c.name) excludedCatNames.add(String(c.name).toLowerCase());
+      }
+    });
+
+    const isCurrentCatExcluded = !isAll && (
+      (category as any).includeInPublicPdf === false ||
+      String((category as any).includeInPublicPdf) === 'false' ||
+      excludedCatIds.has(cleanId.toLowerCase()) ||
+      excludedCatNames.has(cleanId.toLowerCase())
+    );
+
+    // If a private category is directly accessed, show a polite private schedule notice
+    if (isCurrentCatExcluded) {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
+      return res.status(200).send(`
+        <!DOCTYPE html>
+        <html lang="es">
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Categoría Privada - Sacramentos</title>
+          <style>
+            body { font-family: system-ui, -apple-system, sans-serif; background: #f8fafc; color: #1e293b; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
+            .card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 24px; padding: 36px; max-width: 440px; text-align: center; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.05); }
+            .icon { font-size: 48px; margin-bottom: 16px; }
+            h1 { font-size: 20px; font-weight: 800; margin: 0 0 8px 0; color: #0f172a; }
+            p { font-size: 14px; color: #64748b; line-height: 1.5; margin: 0 0 24px 0; }
+            a { display: inline-flex; align-items: center; gap: 8px; background: #4f46e5; color: #ffffff; text-decoration: none; padding: 12px 22px; border-radius: 14px; font-weight: 700; font-size: 13px; }
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <div class="icon">🔒</div>
+            <h1>Categoría Privada</h1>
+            <p>La categoría <strong>${escapeHtml(category.name)}</strong> está configurada como privada y no está habilitada para el PDF público ni por código QR.</p>
+            <a href="/pdf/all">Ver Calendario Público Sacramentos &rarr;</a>
+          </div>
+        </body>
+        </html>
+      `);
+    }
+
     let matchingEvents = isAll
-      ? cleanAllEvents
+      ? cleanAllEvents.filter((e) => {
+          const eCat = String(e.categoryId || '').toLowerCase();
+          const eName = String(e.categoryName || '').toLowerCase();
+          return !excludedCatIds.has(eCat) && !excludedCatNames.has(eCat) && !excludedCatNames.has(eName);
+        })
       : cleanAllEvents.filter((e) => {
+          const eCat = String(e.categoryId || '').toLowerCase();
+          const eName = String(e.categoryName || '').toLowerCase();
+          if (excludedCatIds.has(eCat) || excludedCatNames.has(eCat) || excludedCatNames.has(eName)) {
+            return false;
+          }
           if (e.categoryId === category.id) return true;
-          if (category.name && e.categoryId && e.categoryId.toLowerCase() === category.name.toLowerCase()) return true;
+          if (category.name && (eCat === String(category.name).toLowerCase() || eName === String(category.name).toLowerCase())) return true;
           return false;
         });
 
@@ -5724,7 +6008,11 @@ async function startServer() {
     // or if this is the primary/only category, show all events so scanned phone cameras never see an empty schedule!
     if (matchingEvents.length === 0 && cleanAllEvents.length > 0) {
       if (categories.length <= 1 || cleanId.toLowerCase() === 'new' || cleanId.toLowerCase() === 'client') {
-        matchingEvents = cleanAllEvents;
+        matchingEvents = cleanAllEvents.filter((e) => {
+          const eCat = String(e.categoryId || '').toLowerCase();
+          const eName = String(e.categoryName || '').toLowerCase();
+          return !excludedCatIds.has(eCat) && !excludedCatNames.has(eCat) && !excludedCatNames.has(eName);
+        });
       }
     }
 
@@ -5989,11 +6277,41 @@ async function startServer() {
             hex: categoryHex || '#4f46e5'
           });
 
-      const eventsToRender = (events && events.length > 0)
-        ? events
-        : (catKey === 'all' || catKey === 'overview'
-            ? (freshDb.events || [])
-            : (freshDb.events || []).filter((e: any) => e.categoryId === activeCat.id || (e.categoryId && e.categoryId.toLowerCase() === activeCat.id.toLowerCase())));
+      const excludedCatIds = new Set<string>();
+      const excludedCatNames = new Set<string>();
+      (freshDb.categories || []).forEach((c: any) => {
+        if (c && (c.includeInPublicPdf === false || String(c.includeInPublicPdf) === 'false')) {
+          if (c.id) excludedCatIds.add(String(c.id).toLowerCase());
+          if (c.name) excludedCatNames.add(String(c.name).toLowerCase());
+        }
+      });
+
+      const isCurrentCatExcluded = catKey !== 'all' && catKey !== 'overview' && catKey !== 'sacramentos' && (
+        (activeCat as any).includeInPublicPdf === false ||
+        String((activeCat as any).includeInPublicPdf) === 'false' ||
+        excludedCatIds.has(catKey)
+      );
+
+      const eventsToRender = isCurrentCatExcluded
+        ? []
+        : ((events && events.length > 0)
+            ? events.filter((e: any) => {
+                const eCat = String(e.categoryId || '').toLowerCase();
+                const eName = String(e.categoryName || '').toLowerCase();
+                return !excludedCatIds.has(eCat) && !excludedCatNames.has(eCat) && !excludedCatNames.has(eName);
+              })
+            : (catKey === 'all' || catKey === 'overview' || catKey === 'sacramentos'
+                ? (freshDb.events || []).filter((e: any) => {
+                    const eCat = String(e.categoryId || '').toLowerCase();
+                    const eName = String(e.categoryName || '').toLowerCase();
+                    return !excludedCatIds.has(eCat) && !excludedCatNames.has(eCat) && !excludedCatNames.has(eName);
+                  })
+                : (freshDb.events || []).filter((e: any) => {
+                    const eCat = String(e.categoryId || '').toLowerCase();
+                    const eName = String(e.categoryName || '').toLowerCase();
+                    if (excludedCatIds.has(eCat) || excludedCatNames.has(eCat) || excludedCatNames.has(eName)) return false;
+                    return e.categoryId === activeCat.id || (e.categoryId && e.categoryId.toLowerCase() === activeCat.id.toLowerCase());
+                  })));
 
       // Use client-generated complete multi-month HTML or server-rendered HTML
       const htmlContent = customHtml && typeof customHtml === 'string' && customHtml.trim()

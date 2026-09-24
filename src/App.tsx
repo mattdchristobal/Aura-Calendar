@@ -98,6 +98,7 @@ import {
   saveEventToFirestore,
   deleteEventFromFirestore,
   saveCategoryToFirestore,
+  deleteCategoryFromFirestore,
   saveSettingsToFirestore
 } from './firebaseSync';
 
@@ -329,40 +330,23 @@ export default function App() {
           saveDeletedEventIds(Array.from(localDeletedIds));
         }
 
-        // 3. Categories Bidirectional Merge: preserve custom and default categories, honor valid deletions
+        // 3. Categories Bidirectional Merge: preserve custom and default categories, strictly honor deletions
         const localCategories = loadCategories();
-        const activeLocalCatIds = new Set(localCategories.map((c) => c.id).filter(Boolean));
         const localDeletedCatIds = loadDeletedCategoryIds();
 
-        // Any category actively present on the server was created/approved by an Admin
-        // and must NEVER be treated as deleted locally! Unshield immediately.
-        if (Array.isArray(serverData.categories)) {
-          serverData.categories.forEach((c) => {
-            if (c && c.id) {
-              localDeletedCatIds.delete(c.id);
-              clearDeletedCategoryId(c.id);
+        // Merge server deleted categories into local tombstones
+        if (Array.isArray(serverData.deletedCategoryIds) && serverData.deletedCategoryIds.length > 0) {
+          serverData.deletedCategoryIds.forEach((id: string) => {
+            if (id && typeof id === 'string') {
+              localDeletedCatIds.add(id);
             }
           });
-        }
-
-        // Active local categories must also NEVER be treated as deleted
-        activeLocalCatIds.forEach((id) => {
-          localDeletedCatIds.delete(id);
-          clearDeletedCategoryId(id);
-        });
-
-        if (Array.isArray(serverData.deletedCategoryIds) && serverData.deletedCategoryIds.length > 0) {
-          const activeServerCatIds = new Set((serverData.categories || []).map((c: any) => c?.id).filter(Boolean));
-          const trueDeleted = serverData.deletedCategoryIds.filter(
-            (id) => !activeLocalCatIds.has(id) && !activeServerCatIds.has(id)
-          );
-          recordDeletedCategoryIds(trueDeleted);
-          trueDeleted.forEach((id) => localDeletedCatIds.add(id));
+          recordDeletedCategoryIds(serverData.deletedCategoryIds);
         }
 
         const catMap = new Map<string, Category>();
 
-        // Merge server categories first
+        // Merge server categories first (strictly omitting deleted ones)
         if (Array.isArray(serverData.categories)) {
           serverData.categories.forEach((c) => {
             if (c && c.id && !localDeletedCatIds.has(c.id)) {
@@ -419,19 +403,22 @@ export default function App() {
           Array.from(serverEventMap.values()).filter(e => hasValidOutlookLink || !isOutlookEvent(e))
         );
 
-        // STRICT PERSISTENCE GUARANTEE:
-        // NEVER alter or overwrite any event's categoryId!
-        // For any category present on an event, ensure it exists in catMap and is not marked deleted
-        rawMergedEvents.forEach((e) => {
-          if (e && e.categoryId) {
-            localDeletedCatIds.delete(e.categoryId);
-            clearDeletedCategoryId(e.categoryId);
-            if (!catMap.has(e.categoryId)) {
-              const resolvedCat = getCategoryById(e.categoryId, Array.from(catMap.values()));
-              catMap.set(e.categoryId, resolvedCat);
-            }
+        // For any event with a category that was deleted, reassign it to fallback category!
+        // NEVER resurrect a deleted category!
+        const fallbackCatId = catMap.keys().next().value || 'work';
+        let eventsHadDeletedCategory = false;
+        const normalizedEvents = rawMergedEvents.map((e) => {
+          if (e && e.categoryId && localDeletedCatIds.has(e.categoryId)) {
+            eventsHadDeletedCategory = true;
+            return { ...e, categoryId: fallbackCatId };
           }
+          return e;
         });
+
+        if (eventsHadDeletedCategory) {
+          saveEvents(normalizedEvents);
+          apiBulkSaveEvents(normalizedEvents).catch(() => {});
+        }
 
         saveDeletedCategoryIds(Array.from(localDeletedCatIds));
         const mergedCategories = Array.from(catMap.values());
@@ -439,16 +426,11 @@ export default function App() {
           setCategories(mergedCategories);
           saveCategories(mergedCategories);
 
-          // Update selectedCategoryIds: ensure all active and event categories are selected
+          // Update selectedCategoryIds: ensure only active categories are selected, never deleted ones
           setSelectedCategoryIds((prev) => {
             const validIds = new Set(mergedCategories.map((c) => c.id));
-            rawMergedEvents.forEach((e) => {
-              if (e && e.categoryId) validIds.add(e.categoryId);
-            });
-            const prevSet = new Set(prev.filter((id) => validIds.has(id)));
-            validIds.forEach((id) => prevSet.add(id));
-            const result = Array.from(prevSet);
-            return result.length > 0 ? result : mergedCategories.map((c) => c.id);
+            const filtered = prev.filter((id) => validIds.has(id));
+            return filtered.length > 0 ? filtered : Array.from(validIds);
           });
 
           // Discrepancy push to server ONLY by Admin users to prevent member profiles from overwriting admin changes
@@ -638,13 +620,14 @@ export default function App() {
 
     const unsubCategories = subscribeToFirestoreCategories((cloudCats) => {
       if (!cloudCats || cloudCats.length === 0) return;
+      const deletedSet = loadDeletedCategoryIds();
+      const cleanCloud = cloudCats.filter((c) => c && c.id && !deletedSet.has(c.id));
+
       setCategories((prev) => {
-        const deletedSet = loadDeletedCategoryIds();
-        const cleanCloud = cloudCats.filter((c) => c && c.id && !deletedSet.has(c.id));
-        if (cleanCloud.length === 0) return prev;
-        const catMap = new Map<string, Category>(prev.map((c) => [c.id, c]));
+        const cleanPrev = prev.filter((c) => c && c.id && !deletedSet.has(c.id));
+        const catMap = new Map<string, Category>(cleanPrev.map((c) => [c.id, c]));
         cleanCloud.forEach((c) => catMap.set(c.id, c));
-        const merged = Array.from(catMap.values());
+        const merged = Array.from(catMap.values()).filter((c) => !deletedSet.has(c.id));
         if (JSON.stringify(prev) !== JSON.stringify(merged)) {
           saveCategories(merged);
           return merged;
@@ -652,15 +635,16 @@ export default function App() {
         return prev;
       });
       setSelectedCategoryIds((prev) => {
-        const prevSet = new Set(prev);
+        const validPrev = prev.filter((id) => !deletedSet.has(id));
+        const prevSet = new Set(validPrev);
         let changed = false;
-        cloudCats.forEach((c) => {
-          if (c && c.id && !prevSet.has(c.id)) {
+        cleanCloud.forEach((c) => {
+          if (c && c.id && !prevSet.has(c.id) && !deletedSet.has(c.id)) {
             prevSet.add(c.id);
             changed = true;
           }
         });
-        return changed ? Array.from(prevSet) : prev;
+        return changed ? Array.from(prevSet) : validPrev;
       });
     });
 
@@ -1491,15 +1475,20 @@ export default function App() {
   };
 
   const handleDeleteCategory = async (categoryId: string) => {
+    // 1. Immediately delete from local storage vault and record tombstone
     deleteCategoryFromStorage(categoryId);
 
     const remainingCats = categories.filter((c) => c.id !== categoryId);
     const fallbackCatId = remainingCats.length > 0 ? remainingCats[0].id : 'work';
 
+    // 2. Reassign any events with deleted category to fallback category
+    const eventsToUpdateInCloud: CalendarEvent[] = [];
     setEvents((prev) => {
       const updatedEvents = prev.map((evt) => {
         if (evt.categoryId === categoryId) {
-          return { ...evt, categoryId: fallbackCatId };
+          const updated = { ...evt, categoryId: fallbackCatId, updatedAt: new Date().toISOString() };
+          eventsToUpdateInCloud.push(updated);
+          return updated;
         }
         return evt;
       });
@@ -1508,11 +1497,22 @@ export default function App() {
       return updatedEvents;
     });
 
+    // 3. Update category states
     setCategories(remainingCats);
     saveCategories(remainingCats);
-
     setSelectedCategoryIds((prev) => prev.filter((id) => id !== categoryId));
 
+    // 4. Delete directly from Cloud Firestore and sync reassigned events
+    try {
+      await deleteCategoryFromFirestore(categoryId);
+      for (const uEvt of eventsToUpdateInCloud) {
+        saveEventToFirestore(uEvt).catch(() => {});
+      }
+    } catch (e) {
+      console.warn('Firestore delete category error:', e);
+    }
+
+    // 5. Backend Server deletion & sync
     try {
       await apiDeleteCategory(categoryId);
       await apiBulkSaveCategories(remainingCats);
