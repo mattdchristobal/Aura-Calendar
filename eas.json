@@ -1,12 +1,9 @@
 {
   "build": {
-    "development": {
-      "developmentClient": true,
-      "distribution": "internal"
-    },
-    "preview": {
-      "distribution": "internal"
-    },
-    "production": {}
+    "production": {
+      "ios": {
+        "image": "latest"
+      }
+    }
   }
 }
