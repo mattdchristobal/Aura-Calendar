@@ -1,9 +1,11 @@
 {
   "build": {
+    "preview": {
+      "bun": "1.2.4",
+      "distribution": "internal"
+    },
     "production": {
-      "ios": {
-        "image": "latest"
-      }
+      "bun": "1.2.4"
     }
   }
 }
